@@ -16,7 +16,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v16"
+local VERSION = "v16.1"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -2139,13 +2139,14 @@ local function buildWindow()
 
         create("UIPadding", { PaddingLeft = UDim.new(0, 12) }, button)
 
-        -- marker sits on the tab's right edge, in the corner it owns: it must
-        -- never sit over the label, whatever the browser does with UIPadding
+        -- marker is a short dash in the tab's top-right corner: nowhere near
+        -- the label, and visibly a corner mark rather than an edge line
         local bar = create("Frame", {
             Size = UDim2.new(0, 2, 0, 0),
-            Position = UDim2.new(1, -2, 0, 1),
+            Position = UDim2.new(1, -4, 0, 5),
             BackgroundColor3 = ACCENT,
             BorderSizePixel = 0,
+            AnchorPoint = Vector2.new(1, 0),
         }, button)
         corner(bar, 1)
 
@@ -2156,7 +2157,7 @@ local function buildWindow()
             button.BackgroundColor3 = active and PANEL_HI or TAB_IDLE
             button.TextColor3 = active and TEXT or MUTED
             bar.Size = active
-                and UDim2.new(0, 2, 1, -2)
+                and UDim2.new(0, 2, 0, 8)
                 or UDim2.new(0, 2, 0, 0)
         end
 
