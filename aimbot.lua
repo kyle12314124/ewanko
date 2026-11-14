@@ -1410,7 +1410,7 @@ end
 -- page background, so the list reads as groups instead of one long column.
 local function section(parent, title)
     local frame = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 26),
+        Size = UDim2.new(1, 0, 0, 26),
         BackgroundTransparency = 1,
     }, parent)
 
@@ -1456,15 +1456,17 @@ end
 -- ======================================================================
 
 local function addToggle(parent, text, key, onChange)
+    -- flat row: no card, just a label and its control, with a soft wash on hover
     local row = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 28),
-        BackgroundColor3 = PANEL_LO,
+        Size = UDim2.new(1, 0, 0, 28),
+        BackgroundColor3 = PANEL_HI,
+        BackgroundTransparency = 1,
         BorderSizePixel = 0,
     }, parent)
     corner(row, 6)
 
-    local title = label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0))
-    title.Size = UDim2.new(1, -56, 1, 0)
+    local title = label(row, text, 13, TEXT, UDim2.new(0, 8, 0, 0))
+    title.Size = UDim2.new(1, -54, 1, 0)
 
     local pill = create("Frame", {
         Size = UDim2.new(0, 34, 0, 18),
@@ -1503,10 +1505,10 @@ local function addToggle(parent, text, key, onChange)
     end)
 
     hit.MouseEnter:Connect(function()
-        tween(row, { BackgroundColor3 = PANEL_HI })
+        tween(row, { BackgroundTransparency = 0.9 })
     end)
     hit.MouseLeave:Connect(function()
-        tween(row, { BackgroundColor3 = PANEL_LO })
+        tween(row, { BackgroundTransparency = 1 })
     end)
 
     table.insert(state.refreshers, apply)
@@ -1516,32 +1518,26 @@ end
 
 local function addSlider(parent, text, key, min, max, step, suffix)
     local row = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 46),
-        BackgroundColor3 = PANEL_LO,
+        Size = UDim2.new(1, 0, 0, 46),
+        BackgroundColor3 = PANEL_HI,
+        BackgroundTransparency = 1,
         BorderSizePixel = 0,
     }, parent)
     corner(row, 6)
 
-    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 5)).Size = UDim2.new(1, -108, 0, 16)
+    label(row, text, 13, TEXT, UDim2.new(0, 8, 0, 5)).Size = UDim2.new(1, -114, 0, 16)
 
-    -- the value chip has to hold "3000 deg/s" and "1500 studs" whole
-    local chip = create("Frame", {
-        Size = UDim2.new(0, 82, 0, 18),
-        Position = UDim2.new(1, -92, 0, 4),
-        BackgroundColor3 = PANEL_HI,
-        BorderSizePixel = 0,
-    }, row)
-    corner(chip, 4)
-
+    -- value reads straight off the row: no chip, no second box to look at
     local valueLabel = create("TextLabel", {
         BackgroundTransparency = 1,
-        Font = Enum.Font.GothamMedium,
+        Font = Enum.Font.Code,
         Text = "",
         TextColor3 = ACCENT_SOFT,
         TextSize = 11,
-        TextXAlignment = Enum.TextXAlignment.Center,
-        Size = UDim2.new(1, 0, 1, 0),
-    }, chip)
+        TextXAlignment = Enum.TextXAlignment.Right,
+        Position = UDim2.new(1, -96, 0, 5),
+        Size = UDim2.new(0, 86, 0, 16),
+    }, row)
 
     local track = create("Frame", {
         Size = UDim2.new(1, -20, 0, 5),
@@ -1630,10 +1626,10 @@ local function addSlider(parent, text, key, min, max, step, suffix)
     end)
 
     hit.MouseEnter:Connect(function()
-        tween(row, { BackgroundColor3 = PANEL_HI })
+        tween(row, { BackgroundTransparency = 0.9 })
     end)
     hit.MouseLeave:Connect(function()
-        tween(row, { BackgroundColor3 = PANEL_LO })
+        tween(row, { BackgroundTransparency = 1 })
     end)
 
     table.insert(state.refreshers, apply)
@@ -1643,13 +1639,14 @@ end
 
 local function addCycle(parent, text, key, options)
     local row = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 28),
-        BackgroundColor3 = PANEL_LO,
+        Size = UDim2.new(1, 0, 0, 28),
+        BackgroundColor3 = PANEL_HI,
+        BackgroundTransparency = 1,
         BorderSizePixel = 0,
     }, parent)
     corner(row, 6)
 
-    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0)).Size = UDim2.new(1, -134, 1, 0)
+    label(row, text, 13, TEXT, UDim2.new(0, 8, 0, 0)).Size = UDim2.new(1, -132, 1, 0)
 
     local button = create("TextButton", {
         Size = UDim2.new(0, 112, 0, 20),
@@ -1679,10 +1676,10 @@ local function addCycle(parent, text, key, options)
     end)
 
     button.MouseEnter:Connect(function()
-        tween(row, { BackgroundColor3 = PANEL_HI })
+        tween(row, { BackgroundTransparency = 0.9 })
     end)
     button.MouseLeave:Connect(function()
-        tween(row, { BackgroundColor3 = PANEL_LO })
+        tween(row, { BackgroundTransparency = 1 })
     end)
 
     table.insert(state.refreshers, apply)
@@ -1692,13 +1689,14 @@ end
 
 local function addKeybind(parent, text, key)
     local row = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 28),
-        BackgroundColor3 = PANEL_LO,
+        Size = UDim2.new(1, 0, 0, 28),
+        BackgroundColor3 = PANEL_HI,
+        BackgroundTransparency = 1,
         BorderSizePixel = 0,
     }, parent)
     corner(row, 6)
 
-    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0)).Size = UDim2.new(1, -134, 1, 0)
+    label(row, text, 13, TEXT, UDim2.new(0, 8, 0, 0)).Size = UDim2.new(1, -132, 1, 0)
 
     local button = create("TextButton", {
         Size = UDim2.new(0, 112, 0, 20),
@@ -1735,10 +1733,10 @@ local function addKeybind(parent, text, key)
     end)
 
     button.MouseEnter:Connect(function()
-        tween(row, { BackgroundColor3 = PANEL_HI })
+        tween(row, { BackgroundTransparency = 0.9 })
     end)
     button.MouseLeave:Connect(function()
-        tween(row, { BackgroundColor3 = PANEL_LO })
+        tween(row, { BackgroundTransparency = 1 })
     end)
 
     table.insert(state.refreshers, apply)
@@ -1748,7 +1746,7 @@ end
 
 local function addButton(parent, text, onClick)
     local button = create("TextButton", {
-        Size = UDim2.new(1, -8, 0, 28),
+        Size = UDim2.new(1, 0, 0, 28),
         BackgroundColor3 = PANEL_LO,
         BorderSizePixel = 0,
         Font = Enum.Font.GothamMedium,
@@ -2112,8 +2110,10 @@ local function buildWindow()
         }, frame)
 
         create("UIPadding", {
-            PaddingTop = UDim.new(0, 4),
-            PaddingRight = UDim.new(0, 6),
+            PaddingTop = UDim.new(0, 6),
+            PaddingLeft = UDim.new(0, 4),
+            PaddingRight = UDim.new(0, 4),
+            PaddingBottom = UDim.new(0, 8),
         }, frame)
 
         pages[name] = frame
@@ -2266,7 +2266,7 @@ local function buildWindow()
     -- as a single instrument instead of a column of loose labels
     section(compatibilityPage, "telemetry")
     local console = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 152),
+        Size = UDim2.new(1, 0, 0, 152),
         BackgroundColor3 = PANEL_LO,
         BorderSizePixel = 0,
     }, compatibilityPage)
@@ -2327,7 +2327,7 @@ local function buildWindow()
         "ewanko " .. VERSION .. "  ·  " .. CONFIG.AimMethod .. "  ·  "
             .. tostring(#Players:GetPlayers()) .. " players",
         10, MUTED, UDim2.new(0, 0, 0, 4))
-    footer.Size = UDim2.new(1, -8, 0, 16)
+    footer.Size = UDim2.new(1, 0, 0, 16)
     footer.Font = Enum.Font.Code
     footer.TextXAlignment = Enum.TextXAlignment.Center
 
