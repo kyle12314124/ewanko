@@ -1,5 +1,5 @@
--- ewanko aimbot v9 — crash bisect build: safe boot, staged diagnostics,
--- telemetry heartbeat, camera/mouse nudge tests
+-- ewanko aimbot v11 — camera write bound after the game's camera step,
+-- per-frame mouse fallback, safe boot, staged diagnostics
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
@@ -14,7 +14,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v10"
+local VERSION = "v11"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -44,11 +44,11 @@ local CONFIG = {
     AimMethod         = "Camera",   -- Auto | Camera | Mouse
     MouseGain         = 1.0,
     AutoFallback      = false,      -- off by default: input injection is the crash vector
-    MouseRate         = 20,         -- max mousemoverel calls per second
-    MouseClamp        = 15,         -- max pixels moved per call
+    MouseRate         = 60,         -- mousemoverel calls per second (60 = every frame)
+    MouseClamp        = 45,         -- max pixels moved per call
 
     -- stability
-    RenderPriority    = 200,        -- stock camera slot; raise only after a clean nudge test
+    RenderPriority    = 201,        -- one step AFTER the camera module (200) so the write lands
     SafeMode          = true,       -- no humanize, no Drawing churn, throttled mouse
     PanicKey          = "End",      -- always unloads, works even if the UI is gone
     UIWatchdog        = false,      -- re-parent loop; off while bisecting, it masks the cause
@@ -102,7 +102,7 @@ local state = {
     mouseMode    = false,
     prevAngle    = nil,
     stuckFrames  = 0,
-    nextMouse    = 0,
+    mouseAccum   = 0,
     uiClosed     = false,
     uiRebuilds   = 0,
     stage        = "boot",
@@ -366,44 +366,57 @@ end
 
 -- Drives the game's own camera by moving the mouse, for games that rebuild
 -- Camera.CFrame themselves every frame and overwrite anything written to it.
--- Rate limited and pixel clamped: a hook that floods the client at frame rate
--- is what kills executors, so the call rate is a ceiling, not a target.
-local function clampPixels(value, limit)
-    if value > limit then return limit end
-    if value < -limit then return -limit end
-    return value
-end
-
+-- The controller works in screen pixels: the distance from the target to the
+-- crosshair is the rotation still owed, so one call per frame is the correct
+-- rate. The old 20 Hz cap is what made this feel chunky.
 local function applyMouseAim(camera, targetPart, dt)
     if not hasMouseMove then return false end
 
-    local now = os.clock()
-    if now < state.nextMouse then return true end
+    dt = dt or 1 / 60
 
-    local step = 1 / math.max(CONFIG.MouseRate, 1)
-    state.nextMouse = now + step
+    -- rate gate: 60 means every frame, 30 means every other frame
+    state.mouseAccum += dt
+    local interval = 1 / math.max(CONFIG.MouseRate, 1)
+    if state.mouseAccum < interval then return true end
+    local step = state.mouseAccum
+    state.mouseAccum = 0
 
     local screen = camera:WorldToViewportPoint(targetPart.Position)
     if screen.Z <= 0 then return false end
     if not (isFinite(screen.X) and isFinite(screen.Y)) then return false end
 
     local centre = screenCentre(camera)
-    local tau    = 0.008 + (CONFIG.Smoothness / 100) ^ 2 * 0.9
-    local alpha  = 1 - math.exp(-step / tau)
-
     local errorX = screen.X - centre.X
     local errorY = screen.Y - centre.Y
 
-    local dx = clampPixels(math.floor(errorX * CONFIG.MouseGain * alpha + 0.5), CONFIG.MouseClamp)
-    local dy = clampPixels(math.floor(errorY * CONFIG.MouseGain * alpha + 0.5), CONFIG.MouseClamp)
+    -- sub-pixel error is below what a mouse can express
+    if math.abs(errorX) < 1 and math.abs(errorY) < 1 then return true end
 
-    -- never let rounding stall the approach on a large remaining error
-    if dx == 0 and math.abs(errorX) > 2 then dx = errorX > 0 and 1 or -1 end
-    if dy == 0 and math.abs(errorY) > 2 then dy = errorY > 0 and 1 or -1 end
+    -- Smoothness 0 snaps, 100 glides. tau stays small because the loop already
+    -- runs at frame rate and the pixel cap bounds the travel per call.
+    local tau   = 0.004 + (CONFIG.Smoothness / 100) ^ 2 * 0.35
+    local alpha = 1 - math.exp(-step / tau)
 
-    if dx == 0 and dy == 0 then return true end
+    local dx = errorX * CONFIG.MouseGain * alpha
+    local dy = errorY * CONFIG.MouseGain * alpha
 
-    local ok = pcall(mousemoverel, dx, dy)
+    local cap = math.max(CONFIG.MouseClamp, 1)
+    if dx >  cap then dx =  cap elseif dx < -cap then dx = -cap end
+    if dy >  cap then dy =  cap elseif dy < -cap then dy = -cap end
+
+    -- round on the magnitude, then reapply the sign: math.floor(x + 0.5) on a
+    -- negative number rounds half-steps toward zero and biases the approach
+    local ix = math.floor(math.abs(dx) + 0.5)
+    if dx < 0 then ix = -ix end
+    local iy = math.floor(math.abs(dy) + 0.5)
+    if dy < 0 then iy = -iy end
+
+    -- rounding must never stall the approach on a large remaining error
+    if ix == 0 and math.abs(errorX) > 2 then ix = errorX > 0 and 1 or -1 end
+    if iy == 0 and math.abs(errorY) > 2 then iy = errorY > 0 and 1 or -1 end
+    if ix == 0 and iy == 0 then return true end
+
+    local ok = pcall(mousemoverel, ix, iy)
     if not ok then
         state.mouseMode = false
         return false
@@ -1255,7 +1268,7 @@ local function buildWindow()
     addSlider(compatibilityPage, "Mouse clamp", "MouseClamp", 5, 100, 5, " px")
     addToggle(compatibilityPage, "Auto fallback to mouse", "AutoFallback")
     addToggle(compatibilityPage, "Safe mode", "SafeMode")
-    addSlider(compatibilityPage, "Render priority", "RenderPriority", 200, 2000, 50)
+    addSlider(compatibilityPage, "Render priority", "RenderPriority", 199, 2000, 1)
     addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
     addKeybind(compatibilityPage, "Panic key", "PanicKey")
     addButton(compatibilityPage, "Test: camera write", nudgeCamera)
