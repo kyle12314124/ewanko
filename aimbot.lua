@@ -1,4 +1,5 @@
--- ewanko aimbot v4 — hold/toggle, mouse binds, humanized smoothing
+-- ewanko aimbot v7 — camera or mouse aim, auto fallback when the game
+-- overwrites Camera.CFrame, render priority 1000, live diagnostics
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
@@ -13,7 +14,12 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v4"
+local VERSION = "v7"
+
+-- Last thing to run before the frame is drawn, above every stock and game-side camera binding.
+local RENDER_PRIORITY = 1000
+
+local hasMouseMove = type(mousemoverel) == "function"
 
 local CONFIG = {
     -- aim
@@ -21,7 +27,7 @@ local CONFIG = {
     AimMode           = "Hold",     -- Hold | Toggle
     KeyName           = "Q",        -- keyboard name or MouseButton1/2/3
     FOV               = 140,
-    Smooth            = 1,
+    Smoothness        = 45,         -- 0 = instant snap, 100 = very floaty
     Curve             = "Human",    -- Linear | Ease | Human
     RampIn            = 0.14,       -- seconds to reach full aim speed
     MaxTurnSpeed      = 900,        -- degrees per second ceiling
@@ -33,7 +39,16 @@ local CONFIG = {
     WallCheck         = true,
     Prediction        = 0,
     SelectInterval    = 0.03,
-    RespectScriptable = true,
+
+    -- aim method: mouse mode drives the game's own camera instead of writing CFrames
+    AimMethod         = "Auto",     -- Auto | Camera | Mouse
+    MouseGain         = 1.0,
+    AutoFallback      = true,       -- detect an overwritten camera and switch to mouse
+
+    -- compatibility
+    RespectScriptable = false,      -- write the camera even if the game owns it
+    ForceCustomCamera = false,      -- switch CameraType to Custom while aiming
+    CollidableOnly    = true,       -- raycast ignores non-collidable decoration
 
     -- visuals
     FOVCircle         = true,
@@ -71,11 +86,19 @@ local state = {
     bindArmed    = false,
     nextScan     = 0,
     errorCount   = 0,
+    lastError    = "",
+    savedCamera  = nil,
     esp          = {},
     refreshers   = {},
     dragging     = false,
     dragStart    = nil,
     dragOrigin   = nil,
+    mouseMode    = false,
+    prevAngle    = nil,
+    stuckFrames  = 0,
+    debug        = { candidates = 0, blocked = 0, found = false },
+    debugLabels  = {},
+    lastDebug    = 0,
 }
 
 local MOUSE_BINDS = {
@@ -173,6 +196,13 @@ local function selectTarget()
     local best      = nil
     local bestScore = math.huge
 
+    local debug = state.debug
+    debug.candidates = 0
+    debug.blocked    = 0
+    debug.found      = false
+
+    rayParams.RespectCanCollide = CONFIG.CollidableOnly
+
     for _, player in ipairs(Players:GetPlayers()) do
         if isValidTarget(player) then
             local character = player.Character
@@ -191,20 +221,26 @@ local function selectTarget()
                     if screen.Z > 0 then
                         local offset = (Vector2.new(screen.X, screen.Y) - centre).Magnitude
 
-                        if offset <= CONFIG.FOV and offset < bestScore then
-                            local clear = true
+                        if offset <= CONFIG.FOV then
+                            debug.candidates += 1
 
-                            if CONFIG.WallCheck then
-                                local filter = { character, camera }
-                                if localPlayer.Character then
-                                    table.insert(filter, localPlayer.Character)
+                            if offset < bestScore then
+                                local clear = true
+
+                                if CONFIG.WallCheck then
+                                    local filter = { character, camera }
+                                    if localPlayer.Character then
+                                        table.insert(filter, localPlayer.Character)
+                                    end
+                                    rayParams.FilterDescendantsInstances = filter
+                                    clear = Workspace:Raycast(origin, world - origin, rayParams) == nil
                                 end
-                                rayParams.FilterDescendantsInstances = filter
-                                clear = Workspace:Raycast(origin, world - origin, rayParams) == nil
-                            end
 
-                            if clear then
-                                best, bestScore = part, offset
+                                if clear then
+                                    best, bestScore = part, offset
+                                else
+                                    debug.blocked += 1
+                                end
                             end
                         end
                     end
@@ -213,6 +249,7 @@ local function selectTarget()
         end
     end
 
+    debug.found = best ~= nil
     return best
 end
 
@@ -243,9 +280,9 @@ local function applyAim(camera, targetPart, dt)
 
     if angle <= CONFIG.Deadzone then return end
 
-    -- frame-rate independent alpha: 0.35 is 0.35 per 1/60s at any fps
-    local base  = math.clamp(CONFIG.Smooth, 0.01, 1)
-    local alpha = 1 - (1 - base) ^ (dt * 60)
+    -- time-constant smoothing: 0 snaps, 100 takes ~0.9s to settle
+    local tau   = 0.008 + (CONFIG.Smoothness / 100) ^ 2 * 0.9
+    local alpha = 1 - math.exp(-dt / tau)
 
     if CONFIG.Curve ~= "Linear" then
         local elapsed = os.clock() - (state.aimStarted or os.clock())
@@ -258,6 +295,39 @@ local function applyAim(camera, targetPart, dt)
     local fraction = math.clamp(allowed / angle, 0, 1)
 
     camera.CFrame = current:Lerp(desired, fraction)
+end
+
+local function angleToTarget(camera, world)
+    local delta = world - camera.CFrame.Position
+    if delta.Magnitude < 0.001 then return 0 end
+    local dot = math.clamp(camera.LookVector:Dot(delta.Unit), -1, 1)
+    return math.deg(math.acos(dot))
+end
+
+-- Drives the game's own camera by moving the mouse, for games that rebuild
+-- Camera.CFrame themselves every frame and overwrite anything written to it.
+local function applyMouseAim(camera, targetPart, dt)
+    if not hasMouseMove then return false end
+
+    local screen = camera:WorldToViewportPoint(targetPart.Position)
+    if screen.Z <= 0 then return false end
+
+    local centre = screenCentre(camera)
+    local tau    = 0.008 + (CONFIG.Smoothness / 100) ^ 2 * 0.9
+    local alpha  = 1 - math.exp(-dt / tau)
+
+    local dx = math.floor((screen.X - centre.X) * CONFIG.MouseGain * alpha + 0.5)
+    local dy = math.floor((screen.Y - centre.Y) * CONFIG.MouseGain * alpha + 0.5)
+
+    if dx == 0 and dy == 0 then return true end
+
+    local ok = pcall(mousemoverel, dx, dy)
+    if not ok then
+        state.mouseMode = false
+        return false
+    end
+
+    return true
 end
 
 -- ======================================================================
@@ -367,11 +437,38 @@ end
 -- render
 -- ======================================================================
 
+local function updateDebug(camera)
+    local labels = state.debugLabels
+    if not labels.camera then return end
+
+    local now = os.clock()
+    if now - state.lastDebug < 0.15 then return end
+    state.lastDebug = now
+
+    local debug = state.debug
+
+    labels.camera.Text = "camera: " .. tostring(camera.CameraType)
+    labels.aiming.Text = "aiming: " .. tostring(state.aiming)
+        .. "  target: " .. tostring(debug.found)
+    labels.candidates.Text = "in FOV: " .. tostring(debug.candidates)
+        .. "  wall-blocked: " .. tostring(debug.blocked)
+    labels.resolution.Text = ("viewport: %d x %d"):format(
+        math.floor(camera.ViewportSize.X), math.floor(camera.ViewportSize.Y))
+    labels.priority.Text = "render priority: " .. tostring(RENDER_PRIORITY)
+    labels.method.Text = "method: " .. (state.mouseMode and "mouse" or "camera")
+        .. "  (" .. CONFIG.AimMethod .. ")"
+        .. "  stuck: " .. tostring(state.stuckFrames)
+        .. (hasMouseMove and "" or "  [no mousemoverel]")
+    labels.error.Text = "last error: " .. (state.lastError == "" and "none" or state.lastError)
+end
+
 local function onRender(dt)
     local camera = currentCamera()
     if not camera then return end
 
     dt = math.min(dt or 1 / 60, 0.1)
+
+    updateDebug(camera)
 
     if fovCircle then
         fovCircle.Position  = screenCentre(camera)
@@ -385,11 +482,29 @@ local function onRender(dt)
 
     if not state.aiming or not CONFIG.AimEnabled then
         state.target = nil
+        state.prevAngle = nil
+        state.stuckFrames = 0
         return
     end
 
     if CONFIG.RespectScriptable and camera.CameraType == Enum.CameraType.Scriptable then
         return
+    end
+
+    -- explicit method wins over the auto-detected one
+    if CONFIG.AimMethod == "Camera" and state.mouseMode then
+        state.mouseMode = false
+        state.stuckFrames = 0
+        state.prevAngle = nil
+    elseif CONFIG.AimMethod == "Mouse" and not state.mouseMode then
+        state.mouseMode = true
+    end
+
+    if CONFIG.ForceCustomCamera and camera.CameraType ~= Enum.CameraType.Custom then
+        if state.savedCamera == nil then
+            state.savedCamera = camera.CameraType
+        end
+        camera.CameraType = Enum.CameraType.Custom
     end
 
     local now = os.clock()
@@ -404,14 +519,43 @@ local function onRender(dt)
         return
     end
 
-    applyAim(camera, part, dt)
+    local useMouse = CONFIG.AimMethod == "Mouse"
+        or (CONFIG.AimMethod == "Auto" and state.mouseMode)
+
+    if not useMouse then
+        -- if the angle to target never shrinks, the write lands and is discarded
+        local before = angleToTarget(camera, part.Position)
+
+        if state.prevAngle and before > 2 and before > state.prevAngle - 0.02 then
+            state.stuckFrames += 1
+        else
+            state.stuckFrames = 0
+        end
+        state.prevAngle = before
+
+        if CONFIG.AimMethod == "Auto" and CONFIG.AutoFallback
+            and hasMouseMove and state.stuckFrames > 15 then
+            state.mouseMode = true
+            state.stuckFrames = 0
+            print("[ewanko] camera writes are being overridden — mouse fallback active")
+            applyMouseAim(camera, part, dt)
+            return
+        end
+
+        applyAim(camera, part, dt)
+        return
+    end
+
+    applyMouseAim(camera, part, dt)
 end
 
 local function safeRender(dt)
     local ok, err = pcall(onRender, dt)
     if ok then return end
 
-    state.errorCount += 1
+    state.errorCount  += 1
+    state.lastError = tostring(err)
+
     if state.errorCount >= CONFIG.MaxErrors then
         warn(("[ewanko] self-unbind after %d render errors: %s")
             :format(state.errorCount, tostring(err)))
@@ -678,7 +822,6 @@ local function addKeybind(parent, text, key)
         state.awaitingBind = key
         state.bindArmed = false
         apply()
-        -- the click that opened the bind must not become the bind
         task.delay(0.2, function()
             if state.awaitingBind == key then
                 state.bindArmed = true
@@ -747,6 +890,25 @@ local function loadConfig()
     return true
 end
 
+local function printReport()
+    local camera = currentCamera()
+    print("=== ewanko report ===")
+    print("version:", VERSION)
+    print("place:", game.PlaceId, game.JobId)
+    print("camera:", camera and camera.CameraType or "nil")
+    print("viewport:", camera and tostring(camera.ViewportSize) or "nil")
+    print("aiming:", state.aiming, "target:", state.debug.found)
+    print("in FOV:", state.debug.candidates, "wall-blocked:", state.debug.blocked)
+    print("players:", #Players:GetPlayers())
+    print("last error:", state.lastError)
+    for key, value in pairs(CONFIG) do
+        if type(value) ~= "table" then
+            print(string.format("  %-18s %s", key, tostring(value)))
+        end
+    end
+    print("=== end report ===")
+end
+
 -- ======================================================================
 -- window
 -- ======================================================================
@@ -771,8 +933,8 @@ local function buildWindow()
 
     local window = create("Frame", {
         Name = "Window",
-        Size = UDim2.new(0, 470, 0, 330),
-        Position = UDim2.new(0.5, -235, 0.5, -165),
+        Size = UDim2.new(0, 480, 0, 340),
+        Position = UDim2.new(0.5, -240, 0.5, -170),
         BackgroundColor3 = BG,
         BorderSizePixel = 0,
         ClipsDescendants = true,
@@ -915,11 +1077,13 @@ local function buildWindow()
 
     local aimPage = makePage("AIM")
     local visualPage = makePage("VISUAL")
+    local compatibilityPage = makePage("FIX")
     local configPage = makePage("CONFIG")
 
     makeTab("AIM", 1)
     makeTab("VISUAL", 2)
-    makeTab("CONFIG", 3)
+    makeTab("FIX", 3)
+    makeTab("CONFIG", 4)
 
     addToggle(aimPage, "Enabled", "AimEnabled", function(value)
         if not value then
@@ -930,7 +1094,7 @@ local function buildWindow()
     addCycle(aimPage, "Aim mode", "AimMode", { "Hold", "Toggle" })
     addKeybind(aimPage, "Bind", "KeyName")
     addSlider(aimPage, "FOV", "FOV", 20, 400, 1, "px")
-    addSlider(aimPage, "Smooth", "Smooth", 0.05, 1, 0.05)
+    addSlider(aimPage, "Smoothness", "Smoothness", 0, 100, 1)
     addCycle(aimPage, "Curve", "Curve", { "Linear", "Ease", "Human" })
     addSlider(aimPage, "Ramp in", "RampIn", 0, 0.4, 0.01, " s")
     addSlider(aimPage, "Max turn speed", "MaxTurnSpeed", 90, 3000, 10, " deg/s")
@@ -949,6 +1113,27 @@ local function buildWindow()
     addToggle(visualPage, "ESP names", "ESPNames")
     addToggle(visualPage, "ESP team check", "ESPTeamCheck")
     addSlider(visualPage, "ESP distance", "ESPMaxDistance", 50, 1500, 25, " studs")
+
+    -- FIX tab: the switches that make it work in games that fight the camera
+    addCycle(compatibilityPage, "Aim method", "AimMethod", { "Auto", "Camera", "Mouse" })
+    addSlider(compatibilityPage, "Mouse gain", "MouseGain", 0.1, 3, 0.1)
+    addToggle(compatibilityPage, "Auto fallback to mouse", "AutoFallback")
+    addToggle(compatibilityPage, "Respect Scriptable camera", "RespectScriptable")
+    addToggle(compatibilityPage, "Force Custom camera", "ForceCustomCamera")
+    addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
+    addButton(compatibilityPage, "Print diagnostic report", printReport)
+
+    state.debugLabels.camera = label(compatibilityPage, "camera: -", 11, MUTED)
+    state.debugLabels.aiming = label(compatibilityPage, "aiming: -", 11, MUTED)
+    state.debugLabels.candidates = label(compatibilityPage, "in FOV: -", 11, MUTED)
+    state.debugLabels.resolution = label(compatibilityPage, "viewport: -", 11, MUTED)
+    state.debugLabels.priority = label(compatibilityPage, "render priority: -", 11, MUTED)
+    state.debugLabels.method = label(compatibilityPage, "method: -", 11, MUTED)
+    state.debugLabels.error = label(compatibilityPage, "last error: -", 11, MUTED)
+
+    for _, debugLabel in pairs(state.debugLabels) do
+        debugLabel.Size = UDim2.new(1, -8, 0, 16)
+    end
 
     addButton(configPage, "Save config", function()
         local ok = saveConfig()
@@ -1006,12 +1191,15 @@ local function aimPressed()
 
     if state.aiming then
         state.aimStarted = os.clock()
+    else
+        state.savedCamera = nil
     end
 end
 
 local function aimReleased()
     if CONFIG.AimMode == "Hold" then
         state.aiming = false
+        state.savedCamera = nil
     end
 end
 
@@ -1062,7 +1250,7 @@ if getgenv().EwankoUnload then
     pcall(getgenv().EwankoUnload)
 end
 
-RunService:BindToRenderStep("EwankoAimbot", Enum.RenderPriority.Camera.Value + 1, safeRender)
+RunService:BindToRenderStep("EwankoAimbot", RENDER_PRIORITY, safeRender)
 
 getgenv().EwankoUnload = function()
     RunService:UnbindFromRenderStep("EwankoAimbot")
@@ -1079,4 +1267,5 @@ if isfile and isfile(CONFIG_FILE) then
 end
 
 print("[ewanko] " .. VERSION .. " bound — " .. CONFIG.AimMode .. " " .. CONFIG.KeyName
-    .. " to aim, " .. CONFIG.MenuKeyName .. " for the menu.")
+    .. " to aim, " .. CONFIG.MenuKeyName .. " for the menu, aim method "
+    .. CONFIG.AimMethod .. ".")
