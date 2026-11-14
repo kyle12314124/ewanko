@@ -2089,6 +2089,10 @@ local function buildWindow()
     local pages = {}
     local buttons = {}
 
+    -- Instance fields cannot be extended with custom keys, so the activator
+    -- for each tab lives in a plain Lua table keyed by tab name
+    local tabActivate = {}
+
     local function makePage(name)
         local frame = create("ScrollingFrame", {
             Name = name,
@@ -2141,7 +2145,7 @@ local function buildWindow()
         }, button)
         corner(bar, 1)
 
-        -- active state rides on the button itself, so a hover can never
+        -- active state is tracked as an attribute, so a hover can never
         -- repaint the selected tab back to idle
         local function activate(active)
             button:SetAttribute("active", active)
@@ -2154,8 +2158,8 @@ local function buildWindow()
             for pageName, page in pairs(pages) do
                 page.Visible = (pageName == name)
             end
-            for _, tabButton in pairs(buttons) do
-                tabButton.activate(tabButton == button)
+            for tabName, setActive in pairs(tabActivate) do
+                setActive(tabName == name)
             end
         end)
 
@@ -2170,7 +2174,7 @@ local function buildWindow()
             end
         end)
 
-        button.activate = activate
+        tabActivate[name] = activate
         buttons[name] = button
         return button
     end
@@ -2328,7 +2332,7 @@ local function buildWindow()
     footer.TextXAlignment = Enum.TextXAlignment.Center
 
     pages.AIM.Visible = true
-    buttons.AIM.activate(true)
+    tabActivate.AIM(true)
 
     return gui
 end
