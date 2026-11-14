@@ -16,7 +16,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v16.1"
+local VERSION = "v16.2"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -79,6 +79,14 @@ local CONFIG = {
     ESPNames          = true,
     ESPColor          = { 255, 77, 141 },
     ESPColorNPC       = { 255, 190, 60 },
+
+    -- skeleton + health bar: both ride on their own switch, independent of
+    -- ESP boxes/names, so either can be the only thing on screen
+    SkeletonESP       = false,
+    SkeletonColor     = { 235, 235, 245 },
+    HealthBar         = false,
+    HealthBarWidth    = 3,
+    HealthBarGap      = 10,
 
     -- roles (MM2 and other role games)
     RoleCheck         = true,       -- read murderer / sheriff from tools and attributes
@@ -533,7 +541,7 @@ local MOB_KEYWORDS = {
 }
 
 local HEALTH_ATTRIBUTES = { "Health", "health", "HP", "Hp", "hp", "CurrentHealth", "currentHealth" }
-local HEALTH_CHILDREN   = { "Health", "HP", "HealthValue", "HealthBar" }
+local HEALTH_CHILDREN   = { "Health", "HP", "HealthValue" }
 
 local HEAD_NAMES = { "Head", "head", "Chest", "Core", "UpperTorso", "Torso" }
 local ROOT_NAMES = { "HumanoidRootPart", "Torso", "UpperTorso", "RootPart", "Root" }
@@ -935,6 +943,143 @@ end
 -- esp
 -- ======================================================================
 
+-- ======================================================================
+-- skeleton
+-- ======================================================================
+
+-- Bone chains as name pairs. R15 and R6 both resolve through the same table:
+-- a rig only lights the segments whose two ends exist, so an R6 dummy draws
+-- its six bones and an R15 rig draws the full seventeen with no branch.
+local BONE_CHAINS = {
+    { "Head", "UpperTorso" }, { "Head", "Torso" },
+    { "UpperTorso", "LowerTorso" }, { "Torso", "LowerTorso" },
+    { "UpperTorso", "LeftUpperArm" }, { "UpperTorso", "RightUpperArm" },
+    { "Torso", "Left Arm" }, { "Torso", "Right Arm" },
+    { "LeftUpperArm", "LeftLowerArm" }, { "RightUpperArm", "RightLowerArm" },
+    { "Left Arm", "Left Lower Arm" }, { "Right Arm", "Right Lower Arm" },
+    { "LeftLowerArm", "LeftHand" }, { "RightLowerArm", "RightHand" },
+    { "Left Lower Arm", "Left Hand" }, { "Right Lower Arm", "Right Hand" },
+    { "LowerTorso", "LeftUpperLeg" }, { "LowerTorso", "RightUpperLeg" },
+    { "LowerTorso", "Left Leg" }, { "LowerTorso", "Right Leg" },
+    { "LeftUpperLeg", "LeftLowerLeg" }, { "RightUpperLeg", "RightLowerLeg" },
+    { "Left Leg", "Left Lower Leg" }, { "Right Leg", "Right Lower Leg" },
+    { "LeftLowerLeg", "LeftFoot" }, { "RightLowerLeg", "RightFoot" },
+    { "Left Lower Leg", "Left Foot" }, { "Right Lower Leg", "Right Foot" },
+}
+
+-- Which joint a bone hangs off. Reading one attachment per bone instead of
+-- transforming the whole rig keeps this cheap on a busy server.
+local BONE_JOINTS = {
+    LeftUpperArm  = "LeftShoulder",  RightUpperArm = "RightShoulder",
+    LeftLowerArm  = "LeftElbow",     RightLowerArm = "RightElbow",
+    LeftHand      = "LeftWrist",     RightHand     = "RightWrist",
+    LeftUpperLeg  = "LeftHip",       RightUpperLeg = "RightHip",
+    LeftLowerLeg  = "LeftKnee",      RightLowerLeg = "RightKnee",
+    LeftFoot      = "LeftAnkle",     RightFoot     = "RightAnkle",
+    Head          = "Neck",          UpperTorso    = "Waist",
+}
+
+-- A rig is resolved once and cached against the model, because FindFirstChild
+-- walks per bone per frame otherwise. Pruned with the entry.
+local rigCache = {}
+
+local function bonePosition(rig, name)
+    local part = rig.parts[name]
+    if not part then return nil end
+
+    -- a Motor6D puts the joint at Part1.CFrame * C1; using Part1 keeps the
+    -- pivot on the real joint instead of the limb's centre
+    local joint = rig.joints[name]
+    if joint and joint.Part1 == part then
+        local ok, point = pcall(function()
+            return (part.CFrame * joint.C1).Position
+        end)
+        if ok and point then return point end
+    end
+
+    local ok, point = pcall(function() return part.Position end)
+    if ok then return point end
+    return nil
+end
+
+local function resolveRig(character)
+    local cached = rigCache[character]
+    if cached and cached.root.Parent == character then return cached end
+
+    local root = character:FindFirstChild("HumanoidRootPart") or character.PrimaryPart
+    if not root then return nil end
+
+    local rig = {
+        root   = root,
+        parts  = {},
+        joints = {},
+        chains = {},
+    }
+
+    for _, chain in ipairs(BONE_CHAINS) do
+        local a, b = chain[1], chain[2]
+        local partA = character:FindFirstChild(a)
+        local partB = character:FindFirstChild(b)
+
+        if partA and partB then
+            rig.parts[a] = partA
+            rig.parts[b] = partB
+            table.insert(rig.chains, chain)
+        end
+    end
+
+    if #rig.chains == 0 then return nil end
+
+    local humanoid = character:FindFirstChildOfClass("Humanoid")
+    if humanoid then
+        for bone, jointName in pairs(BONE_JOINTS) do
+            local joint = humanoid:FindFirstChild(jointName)
+            if joint and joint:IsA("Motor6D") then rig.joints[bone] = joint end
+        end
+    end
+
+    rigCache[character] = rig
+    return rig
+end
+
+local function newBonePool(count)
+    local pool = {}
+    for index = 1, count do
+        local ok, line = pcall(function()
+            local l = Drawing.new("Line")
+            l.Thickness   = 1
+            l.Transparency = 0.85
+            l.Visible     = false
+            return l
+        end)
+        if not ok then return nil end
+        pool[index] = line
+    end
+    return pool
+end
+
+local function newHealthBar()
+    local ok, bar = pcall(function()
+        local frame = Drawing.new("Square")
+        frame.Filled      = true
+        frame.Thickness   = 1
+        frame.Transparency = 0.9
+        frame.Visible     = false
+
+        local back = Drawing.new("Square")
+        back.Filled      = true
+        back.Thickness   = 1
+        back.Transparency = 0.35
+        back.Color       = Color3.fromRGB(18, 18, 22)
+        back.Visible     = false
+
+        return { fill = frame, back = back }
+    end)
+
+    if ok then return bar end
+    return nil
+end
+
 local function newESPEntry()
     if typeof(Drawing) ~= "table" then return nil end
 
@@ -957,10 +1102,25 @@ local function newESPEntry()
     return nil
 end
 
+local function hideBones(entry)
+    if not entry or not entry.bones then return end
+    for _, line in ipairs(entry.bones) do
+        line.Visible = false
+    end
+end
+
+local function hideHealthBar(entry)
+    if not entry or not entry.healthBar then return end
+    entry.healthBar.fill.Visible = false
+    entry.healthBar.back.Visible = false
+end
+
 local function hideESP(entry)
     if not entry then return end
     entry.box.Visible  = false
     entry.name.Visible = false
+    hideBones(entry)
+    hideHealthBar(entry)
 end
 
 local function clearESP()
@@ -968,9 +1128,17 @@ local function clearESP()
         pcall(function()
             entry.box:Remove()
             entry.name:Remove()
+            if entry.bones then
+                for _, line in ipairs(entry.bones) do line:Remove() end
+            end
+            if entry.healthBar then
+                entry.healthBar.fill:Remove()
+                entry.healthBar.back:Remove()
+            end
         end)
     end
     state.esp = {}
+    rigCache   = {}
 
     for _, entry in pairs(state.gunESP) do
         pcall(function()
@@ -993,6 +1161,9 @@ local function updateESP(camera)
     local npcColour      = rgb(CONFIG.ESPColorNPC)
     local murdererColour = rgb(CONFIG.ESPColorMurderer)
     local sheriffColour  = rgb(CONFIG.ESPColorSheriff)
+    local skeletonColour = rgb(CONFIG.SkeletonColor)
+    local showSkeleton   = CONFIG.SkeletonESP
+    local showHealth     = CONFIG.HealthBar
     local seen           = {}
 
     for _, target in ipairs(collectTargets()) do
@@ -1068,8 +1239,91 @@ local function updateESP(camera)
                         entry.name.Color    = colour
                         entry.name.Visible  = CONFIG.ESPNames
 
+                        -- health bar: drawn from the root, so it tracks the body
+                        -- even when the head is off screen and the box is not
+                        if showHealth then
+                            local bar = entry.healthBar
+                            if not bar then
+                                bar = newHealthBar()
+                                entry.healthBar = bar
+                            end
+
+                            if bar then
+                                local maxHealth = humanoid and humanoid.MaxHealth or 100
+                                local ratio = math.clamp(
+                                    health / math.max(maxHealth, 1), 0, 1)
+                                local barX  = top.X + width * 0.5 + CONFIG.HealthBarGap
+                                local barW  = math.max(2, CONFIG.HealthBarWidth)
+                                local barH  = math.max(height, 1)
+                                local barY  = top.Y + barH * (1 - ratio)
+                                local barColour = Color3.fromRGB(
+                                    math.floor(255 - 200 * ratio),
+                                    math.floor(60 + 165 * ratio),
+                                    60)
+
+                                bar.back.Position = Vector2.new(barX, top.Y)
+                                bar.back.Size     = Vector2.new(barW, barH)
+                                bar.back.Visible  = true
+
+                                bar.fill.Position = Vector2.new(barX, barY)
+                                bar.fill.Size     = Vector2.new(barW, math.max(barH * ratio, 1))
+                                bar.fill.Color    = barColour
+                                bar.fill.Visible  = true
+                            end
+                        elseif entry.healthBar then
+                            entry.healthBar.fill.Visible = false
+                            entry.healthBar.back.Visible = false
+                        end
+
+                        -- skeleton: overlay lines through the joint positions
+                        if showSkeleton then
+                            local rig = resolveRig(character)
+                            if rig then
+                                local pool = entry.bones
+                                if not pool then
+                                    pool = newBonePool(#rig.chains)
+                                    entry.bones = pool
+                                end
+
+                                if pool then
+                                    for index, chain in ipairs(rig.chains) do
+                                        local line = pool[index]
+                                        if not line then break end
+
+                                        local pointA = bonePosition(rig, chain[1])
+                                        local pointB = bonePosition(rig, chain[2])
+
+                                        if pointA and pointB then
+                                            local from, fromOk = camera:WorldToViewportPoint(pointA)
+                                            local to, toOk     = camera:WorldToViewportPoint(pointB)
+
+                                            if fromOk and toOk and from.Z > 0 and to.Z > 0 then
+                                                line.From     = Vector2.new(from.X, from.Y)
+                                                line.To       = Vector2.new(to.X, to.Y)
+                                                line.Color    = skeletonColour
+                                                line.Visible  = true
+                                            else
+                                                line.Visible = false
+                                            end
+                                        else
+                                            line.Visible = false
+                                        end
+                                    end
+
+                                    for index = #rig.chains + 1, #pool do
+                                        pool[index].Visible = false
+                                    end
+                                end
+                            elseif entry.bones then
+                                hideBones(entry)
+                            end
+                        elseif entry.bones then
+                            hideBones(entry)
+                        end
+
                         seen[character] = true
                         show = CONFIG.ESPBoxes or CONFIG.ESPNames
+                            or showSkeleton or showHealth
                     end
                 end
             end
@@ -1087,8 +1341,16 @@ local function updateESP(camera)
                 pcall(function()
                     entry.box:Remove()
                     entry.name:Remove()
+                    if entry.bones then
+                        for _, line in ipairs(entry.bones) do line:Remove() end
+                    end
+                    if entry.healthBar then
+                        entry.healthBar.fill:Remove()
+                        entry.healthBar.back:Remove()
+                    end
                 end)
-                state.esp[character] = nil
+                rigCache[character]      = nil
+                state.esp[character]     = nil
             end
         end
     end
@@ -2220,6 +2482,12 @@ local function buildWindow()
     addToggle(visualPage, "ESP hide knocked", "ESPKnockCheck")
     addToggle(visualPage, "ESP roles [M]/[S]", "ESPShowRoles")
     addSlider(visualPage, "ESP distance", "ESPMaxDistance", 50, 1500, 25, " studs")
+
+    section(visualPage, "skeleton + health")
+    addToggle(visualPage, "Skeleton ESP", "SkeletonESP")
+    addToggle(visualPage, "Health bar", "HealthBar")
+    addSlider(visualPage, "Health bar width", "HealthBarWidth", 1, 10, 1, "px")
+    addSlider(visualPage, "Health bar gap", "HealthBarGap", 0, 40, 1, "px")
 
     section(visualPage, "items")
     addToggle(visualPage, "ESP dropped gun", "GunESP")
