@@ -1,5 +1,5 @@
--- ewanko aimbot v11 — camera write bound after the game's camera step,
--- per-frame mouse fallback, safe boot, staged diagnostics
+-- ewanko aimbot v12 — camera write at RenderPriority.Last plus a RenderStepped
+-- re-assert, Subject mode, per-frame mouse fallback
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
@@ -14,7 +14,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v11"
+local VERSION = "v12"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -48,7 +48,7 @@ local CONFIG = {
     MouseClamp        = 45,         -- max pixels moved per call
 
     -- stability
-    RenderPriority    = 201,        -- one step AFTER the camera module (200) so the write lands
+    RenderPriority    = 1999,       -- Enum.RenderPriority.Last: nothing writes the camera after this
     SafeMode          = true,       -- no humanize, no Drawing churn, throttled mouse
     PanicKey          = "End",      -- always unloads, works even if the UI is gone
     UIWatchdog        = false,      -- re-parent loop; off while bisecting, it masks the cause
@@ -94,6 +94,10 @@ local state = {
     errorCount   = 0,
     lastError    = "",
     savedCamera  = nil,
+    savedSubject = nil,
+    subjectSaved = false,
+    lastWrite    = nil,
+    writeKept    = false,
     esp          = {},
     refreshers   = {},
     dragging     = false,
@@ -164,19 +168,48 @@ end
 
 -- Claiming the camera is the whole trick: a game camera script stops driving a
 -- Scriptable camera, so the write survives in a match with no input injection.
-local function claimCamera(camera)
+-- "Subject" mode is the other non-injection route: the game's own camera follows
+-- CameraSubject, so handing it the enemy humanoid aims it for us.
+local function claimCamera(camera, part)
     if state.savedCamera == nil then
         state.savedCamera = camera.CameraType
     end
+
+    if CONFIG.AimMethod == "Subject" then
+        local character = part and part.Parent
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            if not state.subjectSaved then
+                state.subjectSaved = true
+                state.savedSubject  = camera.CameraSubject
+            end
+            if camera.CameraSubject ~= humanoid then
+                camera.CameraSubject = humanoid
+            end
+        end
+        if camera.CameraType ~= Enum.CameraType.Custom then
+            camera.CameraType = Enum.CameraType.Custom
+        end
+        return
+    end
+
     if camera.CameraType ~= Enum.CameraType.Scriptable then
         camera.CameraType = Enum.CameraType.Scriptable
     end
 end
 
 local function releaseCamera()
-    if state.savedCamera == nil then return end
-
     local camera = currentCamera()
+
+    if state.subjectSaved then
+        state.subjectSaved = false
+        if camera then
+            pcall(function() camera.CameraSubject = state.savedSubject end)
+        end
+        state.savedSubject = nil
+    end
+
+    if state.savedCamera == nil then return end
     if camera then
         pcall(function() camera.CameraType = state.savedCamera end)
     end
@@ -352,9 +385,11 @@ local function applyAim(camera, targetPart, dt)
     local allowed  = math.min(angle * alpha, CONFIG.MaxTurnSpeed * dt)
     local fraction = math.clamp(allowed / angle, 0, 1)
 
-    if not isFinite(fraction) then return end
+    if not isFinite(fraction) then return nil end
 
-    camera.CFrame = current:Lerp(desired, fraction)
+    local written = current:Lerp(desired, fraction)
+    camera.CFrame = written
+    return written
 end
 
 local function angleToTarget(camera, world)
@@ -553,6 +588,7 @@ local function updateDebug(camera)
     labels.method.Text = "method: " .. (state.mouseMode and "mouse" or "camera")
         .. "  (" .. CONFIG.AimMethod .. ")"
         .. "  stuck: " .. tostring(state.stuckFrames)
+        .. "  write: " .. (state.writeKept and "kept" or "lost")
         .. (hasMouseMove and "" or "  [no mousemoverel]")
     labels.error.Text = "errors: " .. tostring(state.errorCount)
         .. "  last: " .. (state.lastError == "" and "none" or state.lastError)
@@ -588,6 +624,7 @@ local function onRender(dt)
         state.target = nil
         state.prevAngle = nil
         state.stuckFrames = 0
+        state.lastWrite = nil
         releaseCamera()
         return
     end
@@ -611,6 +648,7 @@ local function onRender(dt)
     local part = state.target
     if not part or not part.Parent then
         state.target = nil
+        state.lastWrite = nil
         releaseCamera()
         return
     end
@@ -618,8 +656,21 @@ local function onRender(dt)
     local useMouse = CONFIG.AimMethod == "Mouse"
         or (CONFIG.AimMethod == "Auto" and state.mouseMode)
 
+    if CONFIG.AimMethod == "Subject" then
+        claimCamera(camera, part)
+        state.stage = "subject"
+        return
+    end
+
     if not useMouse then
-        claimCamera(camera)
+        -- did last frame's write survive, or did the game overwrite it?
+        if state.lastWrite then
+            local nowCFrame = camera.CFrame
+            state.writeKept = nowCFrame.LookVector:Dot(state.lastWrite.LookVector) > 0.999
+                and (nowCFrame.Position - state.lastWrite.Position).Magnitude < 0.05
+        end
+
+        claimCamera(camera, part)
 
         -- if the angle to target never shrinks, the write lands and is discarded
         local before = angleToTarget(camera, part.Position)
@@ -641,7 +692,7 @@ local function onRender(dt)
         end
 
         state.stage = "camera"
-        applyAim(camera, part, dt)
+        state.lastWrite = applyAim(camera, part, dt) or state.lastWrite
         return
     end
 
@@ -1262,7 +1313,7 @@ local function buildWindow()
     addSlider(visualPage, "ESP distance", "ESPMaxDistance", 50, 1500, 25, " studs")
 
     -- FIX tab: the switches that make it work in games that fight the camera
-    addCycle(compatibilityPage, "Aim method", "AimMethod", { "Auto", "Camera", "Mouse" })
+    addCycle(compatibilityPage, "Aim method", "AimMethod", { "Auto", "Camera", "Mouse", "Subject" })
     addSlider(compatibilityPage, "Mouse gain", "MouseGain", 0.1, 3, 0.1)
     addSlider(compatibilityPage, "Mouse rate", "MouseRate", 10, 120, 5, " Hz")
     addSlider(compatibilityPage, "Mouse clamp", "MouseClamp", 5, 100, 5, " px")
@@ -1471,6 +1522,26 @@ if getgenv().EwankoUnload then
 end
 
 RunService:BindToRenderStep("EwankoAimbot", CONFIG.RenderPriority, safeRender)
+
+-- Second pass for games that drive their camera from RenderStepped: if the
+-- frame's write was overwritten after the bind step, put it back. One CFrame
+-- comparison per frame, no input injection.
+RunService.RenderStepped:Connect(function()
+    if not alive then return end
+    if CONFIG.AimMethod ~= "Camera" then return end
+    if not state.aiming or not state.lastWrite then return end
+
+    local camera = currentCamera()
+    if not camera then return end
+
+    local current = camera.CFrame
+    if current.LookVector:Dot(state.lastWrite.LookVector) > 0.999
+        and (current.Position - state.lastWrite.Position).Magnitude < 0.05 then
+        return
+    end
+
+    pcall(function() camera.CFrame = state.lastWrite end)
+end)
 
 getgenv().EwankoUnload = function()
     alive = false
