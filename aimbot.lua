@@ -1,5 +1,5 @@
--- ewanko aimbot v7 — camera or mouse aim, auto fallback when the game
--- overwrites Camera.CFrame, render priority 1000, live diagnostics
+-- ewanko aimbot v8 — crash hardening: throttled mouse aim, degraded render
+-- fallback, UI watchdog, panic key, live diagnostics
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
@@ -14,10 +14,10 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v7"
+local VERSION = "v8"
 
--- Last thing to run before the frame is drawn, above every stock and game-side camera binding.
-local RENDER_PRIORITY = 1000
+-- per-instance liveness: a second execution must not kill the first one's loops
+local alive = true
 
 local hasMouseMove = type(mousemoverel) == "function"
 
@@ -44,6 +44,13 @@ local CONFIG = {
     AimMethod         = "Auto",     -- Auto | Camera | Mouse
     MouseGain         = 1.0,
     AutoFallback      = true,       -- detect an overwritten camera and switch to mouse
+    MouseRate         = 40,         -- max mousemoverel calls per second
+    MouseClamp        = 25,         -- max pixels moved per call
+
+    -- stability
+    RenderPriority    = 1000,       -- lower this first if the client dies on aim
+    SafeMode          = true,       -- no humanize, no Drawing churn, throttled mouse
+    PanicKey          = "End",      -- always unloads, works even if the UI is gone
 
     -- compatibility
     RespectScriptable = false,      -- write the camera even if the game owns it
@@ -96,6 +103,9 @@ local state = {
     mouseMode    = false,
     prevAngle    = nil,
     stuckFrames  = 0,
+    nextMouse    = 0,
+    uiClosed     = false,
+    uiRebuilds   = 0,
     debug        = { candidates = 0, blocked = 0, found = false },
     debugLabels  = {},
     lastDebug    = 0,
@@ -264,7 +274,7 @@ local function applyAim(camera, targetPart, dt)
     local desired = CFrame.lookAt(origin, world)
 
     -- human wobble: low-frequency angular noise on the target itself
-    if CONFIG.Curve == "Human" and CONFIG.Humanize > 0 then
+    if CONFIG.Curve == "Human" and CONFIG.Humanize > 0 and not CONFIG.SafeMode then
         local t = os.clock()
         local jitter = CONFIG.Humanize * 0.02
         desired = desired * CFrame.Angles(
@@ -306,18 +316,39 @@ end
 
 -- Drives the game's own camera by moving the mouse, for games that rebuild
 -- Camera.CFrame themselves every frame and overwrite anything written to it.
+-- Rate limited and pixel clamped: a hook that floods the client at frame rate
+-- is what kills executors, so the call rate is a ceiling, not a target.
+local function clampPixels(value, limit)
+    if value > limit then return limit end
+    if value < -limit then return -limit end
+    return value
+end
+
 local function applyMouseAim(camera, targetPart, dt)
     if not hasMouseMove then return false end
+
+    local now = os.clock()
+    if now < state.nextMouse then return true end
+
+    local step = 1 / math.max(CONFIG.MouseRate, 1)
+    state.nextMouse = now + step
 
     local screen = camera:WorldToViewportPoint(targetPart.Position)
     if screen.Z <= 0 then return false end
 
     local centre = screenCentre(camera)
     local tau    = 0.008 + (CONFIG.Smoothness / 100) ^ 2 * 0.9
-    local alpha  = 1 - math.exp(-dt / tau)
+    local alpha  = 1 - math.exp(-step / tau)
 
-    local dx = math.floor((screen.X - centre.X) * CONFIG.MouseGain * alpha + 0.5)
-    local dy = math.floor((screen.Y - centre.Y) * CONFIG.MouseGain * alpha + 0.5)
+    local errorX = screen.X - centre.X
+    local errorY = screen.Y - centre.Y
+
+    local dx = clampPixels(math.floor(errorX * CONFIG.MouseGain * alpha + 0.5), CONFIG.MouseClamp)
+    local dy = clampPixels(math.floor(errorY * CONFIG.MouseGain * alpha + 0.5), CONFIG.MouseClamp)
+
+    -- never let rounding stall the approach on a large remaining error
+    if dx == 0 and math.abs(errorX) > 2 then dx = errorX > 0 and 1 or -1 end
+    if dy == 0 and math.abs(errorY) > 2 then dy = errorY > 0 and 1 or -1 end
 
     if dx == 0 and dy == 0 then return true end
 
@@ -454,12 +485,13 @@ local function updateDebug(camera)
         .. "  wall-blocked: " .. tostring(debug.blocked)
     labels.resolution.Text = ("viewport: %d x %d"):format(
         math.floor(camera.ViewportSize.X), math.floor(camera.ViewportSize.Y))
-    labels.priority.Text = "render priority: " .. tostring(RENDER_PRIORITY)
+    labels.priority.Text = "render priority: " .. tostring(CONFIG.RenderPriority)
     labels.method.Text = "method: " .. (state.mouseMode and "mouse" or "camera")
         .. "  (" .. CONFIG.AimMethod .. ")"
         .. "  stuck: " .. tostring(state.stuckFrames)
         .. (hasMouseMove and "" or "  [no mousemoverel]")
-    labels.error.Text = "last error: " .. (state.lastError == "" and "none" or state.lastError)
+    labels.error.Text = "errors: " .. tostring(state.errorCount)
+        .. "  last: " .. (state.lastError == "" and "none" or state.lastError)
 end
 
 local function onRender(dt)
@@ -551,10 +583,25 @@ end
 
 local function safeRender(dt)
     local ok, err = pcall(onRender, dt)
-    if ok then return end
+    if ok then
+        if state.errorCount > 0 and state.errorCount < CONFIG.MaxErrors then
+            state.errorCount = 0
+            state.lastError = ""
+        end
+        return
+    end
 
     state.errorCount  += 1
     state.lastError = tostring(err)
+
+    -- degrade before dying: drop to the lowest safe render slot and stop touching Drawing
+    if state.errorCount == 3 then
+        CONFIG.SafeMode = true
+        pcall(function() RunService:UnbindFromRenderStep("EwankoAimbot") end)
+        pcall(function()
+            RunService:BindToRenderStep("EwankoAimbot", Enum.RenderPriority.Camera.Value, safeRender)
+        end)
+    end
 
     if state.errorCount >= CONFIG.MaxErrors then
         warn(("[ewanko] self-unbind after %d render errors: %s")
@@ -901,6 +948,9 @@ local function printReport()
     print("in FOV:", state.debug.candidates, "wall-blocked:", state.debug.blocked)
     print("players:", #Players:GetPlayers())
     print("last error:", state.lastError)
+    print("errors:", state.errorCount, "safe mode:", CONFIG.SafeMode)
+    print("method:", state.mouseMode and "mouse" or "camera",
+        "stuck:", state.stuckFrames, "mousemoverel:", hasMouseMove)
     for key, value in pairs(CONFIG) do
         if type(value) ~= "table" then
             print(string.format("  %-18s %s", key, tostring(value)))
@@ -974,6 +1024,7 @@ local function buildWindow()
 
     close.MouseButton1Click:Connect(function()
         gui.Enabled = not gui.Enabled
+        state.uiClosed = not gui.Enabled
     end)
 
     titleBar.InputBegan:Connect(function(input)
@@ -1117,10 +1168,15 @@ local function buildWindow()
     -- FIX tab: the switches that make it work in games that fight the camera
     addCycle(compatibilityPage, "Aim method", "AimMethod", { "Auto", "Camera", "Mouse" })
     addSlider(compatibilityPage, "Mouse gain", "MouseGain", 0.1, 3, 0.1)
+    addSlider(compatibilityPage, "Mouse rate", "MouseRate", 10, 120, 5, " Hz")
+    addSlider(compatibilityPage, "Mouse clamp", "MouseClamp", 5, 100, 5, " px")
     addToggle(compatibilityPage, "Auto fallback to mouse", "AutoFallback")
+    addToggle(compatibilityPage, "Safe mode", "SafeMode")
+    addSlider(compatibilityPage, "Render priority", "RenderPriority", 200, 2000, 50)
     addToggle(compatibilityPage, "Respect Scriptable camera", "RespectScriptable")
     addToggle(compatibilityPage, "Force Custom camera", "ForceCustomCamera")
     addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
+    addKeybind(compatibilityPage, "Panic key", "PanicKey")
     addButton(compatibilityPage, "Print diagnostic report", printReport)
 
     state.debugLabels.camera = label(compatibilityPage, "camera: -", 11, MUTED)
@@ -1180,6 +1236,49 @@ end
 
 local gui = buildWindow()
 
+-- The game can hide, re-parent, or nuke unknown GUIs during a match. The
+-- watchdog re-asserts the window instead of letting it vanish for the session.
+local function uiParent()
+    if gethui then
+        local ok, hidden = pcall(gethui)
+        if ok and hidden then return hidden end
+    end
+    return game:GetService("CoreGui")
+end
+
+local function ensureUI()
+    if not alive or not gui then return end
+
+    local ok = pcall(function()
+        if gui.Parent == nil then
+            local attached = pcall(function() gui.Parent = uiParent() end)
+            if not attached or gui.Parent == nil then
+                local playerGui = localPlayer:FindFirstChildOfClass("PlayerGui")
+                if playerGui then gui.Parent = playerGui end
+            end
+        end
+
+        if not state.uiClosed and not gui.Enabled then
+            gui.Enabled = true
+        end
+    end)
+
+    if ok and gui.Parent ~= nil then return end
+
+    if state.uiRebuilds >= 3 then return end
+    state.uiRebuilds += 1
+    gui = buildWindow()
+    state.uiClosed = false
+end
+
+task.spawn(function()
+    while alive do
+        task.wait(0.75)
+        pcall(ensureUI)
+    end
+end)
+
+
 local function aimPressed()
     if not CONFIG.AimEnabled then return end
 
@@ -1204,6 +1303,14 @@ local function aimReleased()
 end
 
 UserInputService.InputBegan:Connect(function(input, processed)
+    if not alive then return end
+
+    -- panic key is checked first and always: it must work even if the UI is gone
+    if inputMatches(input, CONFIG.PanicKey) then
+        if getgenv().EwankoUnload then getgenv().EwankoUnload() end
+        return
+    end
+
     if state.awaitingBind and state.bindArmed then
         local bind = bindFromInput(input)
         if bind then
@@ -1217,6 +1324,7 @@ UserInputService.InputBegan:Connect(function(input, processed)
 
     if inputMatches(input, CONFIG.MenuKeyName) then
         gui.Enabled = not gui.Enabled
+        state.uiClosed = not gui.Enabled
         return
     end
 
@@ -1250,10 +1358,11 @@ if getgenv().EwankoUnload then
     pcall(getgenv().EwankoUnload)
 end
 
-RunService:BindToRenderStep("EwankoAimbot", RENDER_PRIORITY, safeRender)
+RunService:BindToRenderStep("EwankoAimbot", CONFIG.RenderPriority, safeRender)
 
 getgenv().EwankoUnload = function()
-    RunService:UnbindFromRenderStep("EwankoAimbot")
+    alive = false
+    pcall(function() RunService:UnbindFromRenderStep("EwankoAimbot") end)
     clearESP()
     if fovCircle then
         pcall(function() fovCircle:Remove() end)
@@ -1267,5 +1376,5 @@ if isfile and isfile(CONFIG_FILE) then
 end
 
 print("[ewanko] " .. VERSION .. " bound — " .. CONFIG.AimMode .. " " .. CONFIG.KeyName
-    .. " to aim, " .. CONFIG.MenuKeyName .. " for the menu, aim method "
-    .. CONFIG.AimMethod .. ".")
+    .. " to aim, " .. CONFIG.MenuKeyName .. " for the menu, " .. CONFIG.PanicKey
+    .. " to panic, aim method " .. CONFIG.AimMethod .. ".")
