@@ -1,5 +1,6 @@
--- ewanko aimbot v13 — players and NPCs share one target list, knock/down check,
--- camera write at RenderPriority.Last, per-frame mouse fallback
+-- ewanko aimbot v14 — players and NPCs share one target list, knock/down check,
+-- role detection (murderer / sheriff) and dropped-gun ESP, camera write at
+-- RenderPriority.Last, per-frame mouse fallback
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
@@ -14,7 +15,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v13"
+local VERSION = "v14"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -77,6 +78,19 @@ local CONFIG = {
     ESPColor          = { 255, 77, 141 },
     ESPColorNPC       = { 255, 190, 60 },
 
+    -- roles (MM2 and other role games)
+    RoleCheck         = true,       -- read murderer / sheriff from tools and attributes
+    RoleRate          = 0.5,        -- seconds between role rescans
+    TargetRoles       = "All",      -- All | Murderer | Sheriff | Innocent
+    ESPShowRoles      = true,       -- [M] / [S] prefix in the ESP name
+    ESPColorMurderer  = { 255, 45, 45 },
+    ESPColorSheriff   = { 80, 160, 255 },
+
+    -- dropped items
+    GunESP            = true,       -- ESP the sheriff's gun once it is on the floor
+    GunRate           = 0.3,        -- seconds between dropped-gun rescans
+    ESPColorGun       = { 255, 230, 60 },
+
     -- menu
     MenuKeyName       = "RightShift",
 }
@@ -117,10 +131,14 @@ local state = {
     mouseAccum   = 0,
     npcCache     = {},
     npcNext      = 0,
+    gunCache     = {},
+    gunNext      = 0,
+    gunESP       = {},
     uiClosed     = false,
     uiRebuilds   = 0,
     stage        = "boot",
-    debug        = { candidates = 0, blocked = 0, knocked = 0, npcs = 0, found = false },
+    debug        = { candidates = 0, blocked = 0, knocked = 0, npcs = 0,
+                     murderer = 0, sheriff = 0, guns = 0, found = false },
     debugLabels  = {},
     lastDebug    = 0,
 }
@@ -335,6 +353,167 @@ local function isKnocked(humanoid, character)
     return knocked
 end
 
+-- ======================================================================
+-- roles and dropped items
+-- ======================================================================
+
+-- MM2 hands the murderer a Knife and the sheriff a Gun as Tools in the Backpack,
+-- moved into the character once equipped. Other role games publish the same
+-- information as a player or character attribute, so both are read.
+local MURDERER_TOOLS = {
+    Knife = true, MurdererKnife = true, KnifeTool = true, Dagger = true,
+}
+local SHERIFF_TOOLS = {
+    Gun = true, Revolver = true, Pistol = true, SheriffGun = true,
+}
+local GUN_NAMES = {
+    Gun = true, Revolver = true, Pistol = true, DroppedGun = true,
+}
+local ROLE_ATTRIBUTES = { "Role", "role", "Team", "TeamName", "GameRole", "Assignment" }
+
+local roleCache   = {}
+local rolePruneAt = 0
+
+local function roleFromText(text)
+    if type(text) ~= "string" then return nil end
+    local lower = text:lower()
+    if lower:find("murder") then return "Murderer" end
+    if lower:find("sheriff") or lower:find("sherrif") then return "Sheriff" end
+    if lower:find("innocent") then return "Innocent" end
+    return nil
+end
+
+local function roleFromContainer(container)
+    if not container then return nil end
+
+    for _, child in ipairs(container:GetChildren()) do
+        if child:IsA("Tool") then
+            if MURDERER_TOOLS[child.Name] then return "Murderer" end
+            if SHERIFF_TOOLS[child.Name] then return "Sheriff" end
+        end
+    end
+
+    return nil
+end
+
+-- Returns "Murderer" | "Sheriff" | "Innocent", or nil when the game exposes
+-- nothing: an unknown role must not be reported as innocent, or every player in
+-- an unrelated game would wear the label.
+local function detectRole(player)
+    local character = player.Character
+
+    for _, source in ipairs({ player, character }) do
+        if source then
+            for _, attribute in ipairs(ROLE_ATTRIBUTES) do
+                local role = roleFromText(source:GetAttribute(attribute))
+                if role then return role end
+            end
+        end
+    end
+
+    local role = roleFromContainer(character)
+        or roleFromContainer(player:FindFirstChildOfClass("Backpack"))
+    if role then return role end
+
+    if character then
+        local humanoid = character:FindFirstChildOfClass("Humanoid")
+        if humanoid then
+            local fromName = roleFromText(humanoid.DisplayName)
+            if fromName then return fromName end
+        end
+    end
+
+    return nil
+end
+
+-- Cached per player: role detection walks the Backpack and reads attributes,
+-- which is not a per-frame operation but is cheap at RoleRate.
+local function roleOf(player)
+    if not CONFIG.RoleCheck then return nil end
+
+    local now    = os.clock()
+    local cached = roleCache[player]
+    if cached and now - cached.at < math.max(CONFIG.RoleRate, 0.1) then
+        return cached.role
+    end
+
+    local role = detectRole(player)
+    roleCache[player] = { at = now, role = role }
+
+    if now >= rolePruneAt then
+        rolePruneAt = now + 10
+        for key, entry in pairs(roleCache) do
+            if key.Parent == nil or now - entry.at > 5 then roleCache[key] = nil end
+        end
+    end
+
+    return role
+end
+
+-- A gun inside a player's character is being carried; only the one on the floor
+-- is worth an ESP box. Walking the ancestor chain catches the tool whether it is
+-- parented to the character, to a folder, or to a wrapper model.
+local function carriedByPlayer(inst)
+    local parent = inst.Parent
+
+    while parent and parent ~= Workspace do
+        if parent:IsA("Model") and Players:GetPlayerFromCharacter(parent) then
+            return true
+        end
+        parent = parent.Parent
+    end
+
+    return false
+end
+
+local function gunPosition(gun)
+    if gun:IsA("Tool") then
+        local handle = gun:FindFirstChild("Handle")
+        return handle and handle.Position or nil
+    end
+
+    if gun:IsA("BasePart") then return gun.Position end
+
+    if gun:IsA("Model") then
+        if gun.PrimaryPart then return gun.PrimaryPart.Position end
+        local ok, pivot = pcall(function() return gun:GetPivot().Position end)
+        if ok then return pivot end
+    end
+
+    return nil
+end
+
+local function collectDroppedGuns()
+    local found = {}
+
+    local function walk(container, depth)
+        if depth > CONFIG.NPCDepth + 1 then return end
+
+        for _, child in ipairs(container:GetChildren()) do
+            if (child:IsA("Tool") or child:IsA("Model") or child:IsA("BasePart"))
+                and GUN_NAMES[child.Name] then
+                if not carriedByPlayer(child) then
+                    table.insert(found, child)
+                end
+            elseif child:IsA("Model") or child:IsA("Folder") then
+                walk(child, depth + 1)
+            end
+        end
+    end
+
+    pcall(function() walk(Workspace, 0) end)
+    return found
+end
+
+local function currentGuns()
+    local now = os.clock()
+    if now >= state.gunNext then
+        state.gunNext  = now + math.max(CONFIG.GunRate, 0.1)
+        state.gunCache = collectDroppedGuns()
+    end
+    return state.gunCache
+end
+
 -- NPC scan: depth-limited walk of Workspace for Models with a Humanoid that no
 -- player owns. Throttled, because GetChildren over a whole place is not a
 -- per-frame operation.
@@ -387,6 +566,7 @@ local function collectTargets()
                     name      = player.Name,
                     player    = player,
                     isNPC     = false,
+                    role      = roleOf(player),
                     enemy     = isEnemy(player),
                 }
             end
@@ -404,6 +584,7 @@ local function collectTargets()
                         name      = character.Name,
                         player    = nil,
                         isNPC     = true,
+                        role      = nil,
                         enemy     = true,
                     }
                 end
@@ -432,13 +613,23 @@ local function selectTarget()
 
     rayParams.RespectCanCollide = CONFIG.CollidableOnly
 
+    local wanted = CONFIG.TargetRoles
+
     for _, target in ipairs(collectTargets()) do
         if target.isNPC then debug.npcs += 1 end
 
         local character = target.character
         local humanoid  = target.humanoid
 
-        if target.enemy and humanoid.Health > 0 then
+        -- the role filter applies to players only: an NPC has no role to match
+        local roleOk = target.isNPC
+            or wanted == "All"
+            or (wanted == "Murderer" and target.role == "Murderer")
+            or (wanted == "Sheriff" and target.role == "Sheriff")
+            or (wanted == "Innocent" and target.role ~= "Murderer"
+                and target.role ~= "Sheriff")
+
+        if roleOk and target.enemy and humanoid.Health > 0 then
             local part = aimPartFor(character)
 
             if part then
@@ -656,18 +847,29 @@ local function clearESP()
         end)
     end
     state.esp = {}
+
+    for _, entry in pairs(state.gunESP) do
+        pcall(function()
+            entry.box:Remove()
+            entry.name:Remove()
+        end)
+    end
+    state.gunESP = {}
 end
 
 local function updateESP(camera)
     if not CONFIG.ESP or typeof(Drawing) ~= "table" then
         for _, entry in pairs(state.esp) do hideESP(entry) end
+        for _, entry in pairs(state.gunESP) do hideESP(entry) end
         return
     end
 
-    local origin       = camera.CFrame.Position
-    local playerColour = rgb(CONFIG.ESPColor)
-    local npcColour    = rgb(CONFIG.ESPColorNPC)
-    local seen         = {}
+    local origin         = camera.CFrame.Position
+    local playerColour   = rgb(CONFIG.ESPColor)
+    local npcColour      = rgb(CONFIG.ESPColorNPC)
+    local murdererColour = rgb(CONFIG.ESPColorMurderer)
+    local sheriffColour  = rgb(CONFIG.ESPColorSheriff)
+    local seen           = {}
 
     for _, target in ipairs(collectTargets()) do
         local character = target.character
@@ -696,14 +898,26 @@ local function updateESP(camera)
                     if entry then
                         local height = math.abs(bottom.Y - top.Y)
                         local width  = height * 0.6
-                        local colour = target.isNPC and npcColour or playerColour
+
+                        local colour = playerColour
+                        local prefix = ""
+
+                        if target.isNPC then
+                            colour = npcColour
+                        elseif target.role == "Murderer" then
+                            colour = murdererColour
+                            prefix = "[M] "
+                        elseif target.role == "Sheriff" then
+                            colour = sheriffColour
+                            prefix = "[S] "
+                        end
 
                         entry.box.Position = Vector2.new(top.X - width * 0.5, top.Y)
                         entry.box.Size     = Vector2.new(width, height)
                         entry.box.Color    = colour
                         entry.box.Visible  = CONFIG.ESPBoxes
 
-                        entry.name.Text     = target.name
+                        entry.name.Text     = (CONFIG.ESPShowRoles and prefix or "") .. target.name
                         entry.name.Position = Vector2.new(top.X, top.Y - 16)
                         entry.name.Color    = colour
                         entry.name.Visible  = CONFIG.ESPNames
@@ -732,6 +946,67 @@ local function updateESP(camera)
             end
         end
     end
+
+    -- dropped gun: the sheriff's Tool lands in Workspace on death. Boxed and
+    -- labelled with its distance so the walk to it is a straight line.
+    local gunsSeen = {}
+
+    if CONFIG.GunESP then
+        local gunColour = rgb(CONFIG.ESPColorGun)
+
+        for _, gun in ipairs(currentGuns()) do
+            local position = gunPosition(gun)
+
+            if position then
+                local distance = (position - origin).Magnitude
+
+                if distance <= CONFIG.ESPMaxDistance then
+                    local screen, onScreen = camera:WorldToViewportPoint(position)
+
+                    if onScreen and screen.Z > 0 then
+                        local entry = state.gunESP[gun]
+                        if not entry then
+                            entry = newESPEntry()
+                            state.gunESP[gun] = entry
+                        end
+
+                        if entry then
+                            -- constant screen size: 1200 / distance keeps the
+                            -- box readable at 20 studs and at 200
+                            local size = math.clamp(1200 / math.max(distance, 1), 8, 70)
+
+                            entry.box.Position = Vector2.new(
+                                screen.X - size * 0.5, screen.Y - size * 0.5)
+                            entry.box.Size     = Vector2.new(size, size)
+                            entry.box.Color    = gunColour
+                            entry.box.Visible  = CONFIG.ESPBoxes
+
+                            entry.name.Text     = ("GUN  %dm"):format(math.floor(distance))
+                            entry.name.Position = Vector2.new(
+                                screen.X, screen.Y - size * 0.5 - 16)
+                            entry.name.Color    = gunColour
+                            entry.name.Visible  = CONFIG.ESPNames
+
+                            gunsSeen[gun] = true
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    for gun, entry in pairs(state.gunESP) do
+        if not gunsSeen[gun] then
+            hideESP(entry)
+            if not gun.Parent then
+                pcall(function()
+                    entry.box:Remove()
+                    entry.name:Remove()
+                end)
+                state.gunESP[gun] = nil
+            end
+        end
+    end
 end
 
 -- ======================================================================
@@ -748,6 +1023,21 @@ local function updateDebug(camera)
 
     local debug = state.debug
 
+    -- role census: cached lookups, so this is a cheap pass at 6.6 Hz
+    local murderer, sheriff = 0, 0
+    for _, player in ipairs(Players:GetPlayers()) do
+        local role = roleOf(player)
+        if role == "Murderer" then
+            murderer += 1
+        elseif role == "Sheriff" then
+            sheriff += 1
+        end
+    end
+
+    debug.murderer = murderer
+    debug.sheriff  = sheriff
+    debug.guns     = #currentGuns()
+
     labels.camera.Text = "camera: " .. tostring(camera.CameraType)
     labels.aiming.Text = "aiming: " .. tostring(state.aiming)
         .. "  target: " .. tostring(debug.found)
@@ -763,6 +1053,10 @@ local function updateDebug(camera)
         .. "  stuck: " .. tostring(state.stuckFrames)
         .. "  write: " .. (state.writeKept and "kept" or "lost")
         .. (hasMouseMove and "" or "  [no mousemoverel]")
+    labels.roles.Text = "murderer: " .. tostring(debug.murderer)
+        .. "  sheriff: " .. tostring(debug.sheriff)
+        .. "  dropped guns: " .. tostring(debug.guns)
+        .. "  aiming at: " .. CONFIG.TargetRoles
     labels.error.Text = "errors: " .. tostring(state.errorCount)
         .. "  last: " .. (state.lastError == "" and "none" or state.lastError)
 end
@@ -1236,6 +1530,8 @@ local function printReport()
     print("aiming:", state.aiming, "target:", state.debug.found)
     print("in FOV:", state.debug.candidates, "wall-blocked:", state.debug.blocked,
         "knocked:", state.debug.knocked, "npcs:", state.debug.npcs)
+    print("murderer:", state.debug.murderer, "sheriff:", state.debug.sheriff,
+        "dropped guns:", state.debug.guns, "target role:", CONFIG.TargetRoles)
     print("players:", #Players:GetPlayers())
     print("last error:", state.lastError)
     print("errors:", state.errorCount, "safe mode:", CONFIG.SafeMode)
@@ -1479,6 +1775,8 @@ local function buildWindow()
     addToggle(aimPage, "Wall check", "WallCheck")
     addToggle(aimPage, "Skip knocked/downed", "KnockCheck")
     addToggle(aimPage, "Aim at NPCs", "NPCs", refreshAll)
+    addToggle(aimPage, "Role check", "RoleCheck")
+    addCycle(aimPage, "Target role", "TargetRoles", { "All", "Murderer", "Sheriff", "Innocent" })
 
     addToggle(visualPage, "FOV circle", "FOVCircle")
     addSlider(visualPage, "Circle thickness", "CircleThickness", 1, 4, 1, "px")
@@ -1488,6 +1786,8 @@ local function buildWindow()
     addToggle(visualPage, "ESP team check", "ESPTeamCheck")
     addToggle(visualPage, "ESP NPCs", "NPCs", refreshAll)
     addToggle(visualPage, "ESP hide knocked", "ESPKnockCheck")
+    addToggle(visualPage, "ESP roles [M]/[S]", "ESPShowRoles")
+    addToggle(visualPage, "ESP dropped gun", "GunESP")
     addSlider(visualPage, "ESP distance", "ESPMaxDistance", 50, 1500, 25, " studs")
 
     -- FIX tab: the switches that make it work in games that fight the camera
@@ -1501,6 +1801,8 @@ local function buildWindow()
     addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
     addSlider(compatibilityPage, "NPC rescan", "NPCRate", 0.1, 2, 0.1, " s")
     addSlider(compatibilityPage, "NPC scan depth", "NPCDepth", 1, 4, 1)
+    addSlider(compatibilityPage, "Role rescan", "RoleRate", 0.1, 2, 0.1, " s")
+    addSlider(compatibilityPage, "Gun rescan", "GunRate", 0.1, 2, 0.1, " s")
     addKeybind(compatibilityPage, "Panic key", "PanicKey")
     addButton(compatibilityPage, "Test: camera write", nudgeCamera)
     addButton(compatibilityPage, "Test: mouse move", nudgeMouse)
@@ -1514,6 +1816,7 @@ local function buildWindow()
     state.debugLabels.resolution = label(compatibilityPage, "viewport: -", 11, MUTED)
     state.debugLabels.priority = label(compatibilityPage, "render priority: -", 11, MUTED)
     state.debugLabels.method = label(compatibilityPage, "method: -", 11, MUTED)
+    state.debugLabels.roles = label(compatibilityPage, "roles: -", 11, MUTED)
     state.debugLabels.error = label(compatibilityPage, "last error: -", 11, MUTED)
 
     for _, debugLabel in pairs(state.debugLabels) do
@@ -1683,6 +1986,8 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
+    roleCache[player] = nil
+
     local character = player.Character
     local entry = character and state.esp[character]
     if entry then
