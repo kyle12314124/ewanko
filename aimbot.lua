@@ -16,7 +16,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v16.2"
+local VERSION = "v16.3"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -98,6 +98,7 @@ local CONFIG = {
 
     -- streamer mode: one press kills every visual this script draws
     StealthKey        = "F2",
+    PeekKey           = "F3",       -- hold while hidden to look, release to hide
     AutoHideOnBlur    = true,       -- hide the moment the window loses focus
     StealthOnStart    = false,      -- boot hidden, reveal with StealthKey
 }
@@ -144,6 +145,7 @@ local state = {
     uiClosed     = false,
     uiRebuilds   = 0,
     stealth      = false,
+    peeking      = false,
     statusLabel  = nil,
     lastDt       = 1 / 60,
     stage        = "boot",
@@ -988,7 +990,7 @@ end
 
 local function updateESP(camera)
     -- streamer mode hides every drawing, and the loop must stop re-showing them
-    if not CONFIG.ESP or typeof(Drawing) ~= "table" or state.stealth then
+    if not CONFIG.ESP or typeof(Drawing) ~= "table" or (state.stealth and not state.peeking) then
         for _, entry in pairs(state.esp) do hideESP(entry) end
         for _, entry in pairs(state.gunESP) do hideESP(entry) end
         return
@@ -1231,7 +1233,7 @@ local function onRender(dt)
             circle.Radius    = CONFIG.FOV
             circle.Color     = rgb(CONFIG.CircleColor)
             circle.Thickness = CONFIG.CircleThickness
-            circle.Visible   = state.aiming and not state.stealth
+            circle.Visible   = state.aiming and (not state.stealth or state.peeking)
         end
     elseif fovCircle then
         fovCircle.Visible = false
@@ -2348,6 +2350,7 @@ local function buildWindow()
     section(configPage, "system")
     addKeybind(configPage, "Menu key", "MenuKeyName")
     addKeybind(configPage, "Streamer key", "StealthKey")
+    addKeybind(configPage, "Peek key", "PeekKey")
     addToggle(configPage, "Auto-hide on blur", "AutoHideOnBlur")
     addToggle(configPage, "Start hidden", "StealthOnStart")
 
@@ -2387,6 +2390,7 @@ local gui = buildWindow()
 setStealth = function(on)
     on = on and true or false
     state.stealth = on
+    state.peeking = false
 
     if gui then
         pcall(function() gui.Enabled = not on end)
@@ -2420,6 +2424,27 @@ end
 
 if CONFIG.StealthOnStart then
     setStealth(true)
+end
+
+-- Streamer mode can still be read without leaving it: holding the peek key
+-- brings the window and the ESP back for exactly as long as it is held. This is
+-- the only shape this can take inside a client -- whatever is on screen when a
+-- frame is captured is in the capture, so the guarantee is "hidden unless you
+-- are actively holding peek", never "visible to me, invisible to the recorder".
+local function peek(on)
+    if not state.stealth then return end
+    on = on and true or false
+    if state.peeking == on then return end
+    state.peeking = on
+
+    if gui then
+        pcall(function() gui.Enabled = on end)
+    end
+
+    local chip = state.streamChip
+    if chip and chip.Parent then
+        pcall(function() chip.Text = on and "PEEK" or "HIDDEN" end)
+    end
 end
 
 -- alt-tabbing out (to the recorder, discord, a browser) drops everything too,
@@ -2546,6 +2571,12 @@ UserInputService.InputBegan:Connect(function(input, processed)
         return
     end
 
+    -- peek: hold to look while hidden, everything comes back down on release
+    if inputMatches(input, CONFIG.PeekKey) then
+        peek(true)
+        return
+    end
+
     if state.awaitingBind and state.bindArmed then
         local bind = bindFromInput(input)
         if bind then
@@ -2577,6 +2608,9 @@ end)
 UserInputService.InputEnded:Connect(function(input)
     if inputMatches(input, CONFIG.KeyName) then
         aimReleased()
+    end
+    if inputMatches(input, CONFIG.PeekKey) then
+        peek(false)
     end
 end)
 
