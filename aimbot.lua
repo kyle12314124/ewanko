@@ -2121,8 +2121,8 @@ local function buildWindow()
     end
 
     local function makeTab(name, order)
-        -- flush to the strip's left edge: the accent bar has to sit on that
-        -- edge, not float 6px inside it
+        -- flush to the strip's left edge, so the marker has a clean corner
+        -- to sit in instead of floating inside the button
         local button = create("TextButton", {
             Size = UDim2.new(1, -8, 0, 28),
             Position = UDim2.new(0, 0, 0, 8 + (order - 1) * 32),
@@ -2139,11 +2139,11 @@ local function buildWindow()
 
         create("UIPadding", { PaddingLeft = UDim.new(0, 12) }, button)
 
-        -- full-height marker, inset 1px top and bottom so it follows the
-        -- button's rounded corners instead of cutting across them
+        -- marker sits on the tab's right edge, in the corner it owns: it must
+        -- never sit over the label, whatever the browser does with UIPadding
         local bar = create("Frame", {
             Size = UDim2.new(0, 2, 0, 0),
-            Position = UDim2.new(0, 0, 0, 1),
+            Position = UDim2.new(1, -2, 0, 1),
             BackgroundColor3 = ACCENT,
             BorderSizePixel = 0,
         }, button)
