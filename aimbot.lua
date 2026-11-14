@@ -1,10 +1,9 @@
--- ewanko aimbot v3 — UI framework + aimbot + ESP
+-- ewanko aimbot v4 — hold/toggle, mouse binds, humanized smoothing
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
 local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
-local TweenService     = game:GetService("TweenService")
 local HttpService      = game:GetService("HttpService")
 local Workspace        = game:GetService("Workspace")
 
@@ -14,14 +13,20 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v3"
+local VERSION = "v4"
 
 local CONFIG = {
     -- aim
     AimEnabled        = true,
-    KeyName           = "Q",
+    AimMode           = "Hold",     -- Hold | Toggle
+    KeyName           = "Q",        -- keyboard name or MouseButton1/2/3
     FOV               = 140,
     Smooth            = 1,
+    Curve             = "Human",    -- Linear | Ease | Human
+    RampIn            = 0.14,       -- seconds to reach full aim speed
+    MaxTurnSpeed      = 900,        -- degrees per second ceiling
+    Deadzone          = 0.6,        -- degrees; no micro-correction inside
+    Humanize          = 0.35,       -- 0..1 wobble amount (Human curve only)
     MaxDistance       = 600,
     AimPart           = "Head",
     TeamCheck         = true,
@@ -60,7 +65,10 @@ end
 
 local state = {
     aiming       = false,
+    aimStarted   = 0,
+    target       = nil,
     awaitingBind = nil,
+    bindArmed    = false,
     nextScan     = 0,
     errorCount   = 0,
     esp          = {},
@@ -70,12 +78,32 @@ local state = {
     dragOrigin   = nil,
 }
 
-local function keyCodeFor(name)
-    return Enum.KeyCode[name] or Enum.KeyCode.Unknown
-end
+local MOUSE_BINDS = {
+    MouseButton1 = true,
+    MouseButton2 = true,
+    MouseButton3 = true,
+}
 
 local function rgb(triple)
     return Color3.fromRGB(triple[1], triple[2], triple[3])
+end
+
+local function inputMatches(input, bindName)
+    if MOUSE_BINDS[bindName] then
+        return input.UserInputType == Enum.UserInputType[bindName]
+    end
+    return input.UserInputType == Enum.UserInputType.Keyboard
+        and input.KeyCode == Enum.KeyCode[bindName]
+end
+
+local function bindFromInput(input)
+    if input.UserInputType == Enum.UserInputType.Keyboard then
+        return input.KeyCode.Name
+    end
+    if MOUSE_BINDS[input.UserInputType.Name] then
+        return input.UserInputType.Name
+    end
+    return nil
 end
 
 -- ======================================================================
@@ -176,7 +204,7 @@ local function selectTarget()
                             end
 
                             if clear then
-                                best, bestScore = world, offset
+                                best, bestScore = part, offset
                             end
                         end
                     end
@@ -186,6 +214,50 @@ local function selectTarget()
     end
 
     return best
+end
+
+local function applyAim(camera, targetPart, dt)
+    local origin  = camera.CFrame.Position
+    local world   = targetPart.Position
+
+    if CONFIG.Prediction > 0 then
+        world += targetPart.AssemblyLinearVelocity * CONFIG.Prediction
+    end
+
+    local desired = CFrame.lookAt(origin, world)
+
+    -- human wobble: low-frequency angular noise on the target itself
+    if CONFIG.Curve == "Human" and CONFIG.Humanize > 0 then
+        local t = os.clock()
+        local jitter = CONFIG.Humanize * 0.02
+        desired = desired * CFrame.Angles(
+            math.noise(t * 3.1, 11.7) * jitter,
+            math.noise(t * 3.1, 0.5) * jitter,
+            0
+        )
+    end
+
+    local current = camera.CFrame
+    local dot     = math.clamp(current.LookVector:Dot(desired.LookVector), -1, 1)
+    local angle   = math.deg(math.acos(dot))
+
+    if angle <= CONFIG.Deadzone then return end
+
+    -- frame-rate independent alpha: 0.35 is 0.35 per 1/60s at any fps
+    local base  = math.clamp(CONFIG.Smooth, 0.01, 1)
+    local alpha = 1 - (1 - base) ^ (dt * 60)
+
+    if CONFIG.Curve ~= "Linear" then
+        local elapsed = os.clock() - (state.aimStarted or os.clock())
+        local ramp    = math.clamp(elapsed / math.max(CONFIG.RampIn, 0.001), 0, 1)
+        alpha = alpha * (0.25 + 0.75 * ramp)
+    end
+
+    -- hard angular velocity ceiling, the part that reads as human
+    local allowed  = math.min(angle * alpha, CONFIG.MaxTurnSpeed * dt)
+    local fraction = math.clamp(allowed / angle, 0, 1)
+
+    camera.CFrame = current:Lerp(desired, fraction)
 end
 
 -- ======================================================================
@@ -295,48 +367,48 @@ end
 -- render
 -- ======================================================================
 
-local function onRender()
+local function onRender(dt)
     local camera = currentCamera()
     if not camera then return end
+
+    dt = math.min(dt or 1 / 60, 0.1)
 
     if fovCircle then
         fovCircle.Position  = screenCentre(camera)
         fovCircle.Radius    = CONFIG.FOV
         fovCircle.Color     = rgb(CONFIG.CircleColor)
         fovCircle.Thickness = CONFIG.CircleThickness
-        fovCircle.Visible   = CONFIG.FOVCircle and (state.aiming or CONFIG.AimEnabled == false)
+        fovCircle.Visible   = CONFIG.FOVCircle and state.aiming
     end
 
     updateESP(camera)
 
-    if not state.aiming or not CONFIG.AimEnabled then return end
+    if not state.aiming or not CONFIG.AimEnabled then
+        state.target = nil
+        return
+    end
 
     if CONFIG.RespectScriptable and camera.CameraType == Enum.CameraType.Scriptable then
         return
     end
 
     local now = os.clock()
-    if now < state.nextScan then
+    if now >= state.nextScan then
+        state.nextScan = now + CONFIG.SelectInterval
+        state.target = selectTarget()
+    end
+
+    local part = state.target
+    if not part or not part.Parent then
+        state.target = nil
         return
     end
-    state.nextScan = now + CONFIG.SelectInterval
 
-    local target = selectTarget()
-    if not target then return end
-
-    local origin  = camera.CFrame.Position
-    local desired = CFrame.lookAt(origin, target)
-    local alpha   = math.clamp(CONFIG.Smooth, 0, 1)
-
-    if alpha >= 1 then
-        camera.CFrame = desired
-    elseif alpha > 0 then
-        camera.CFrame = camera.CFrame:Lerp(desired, alpha)
-    end
+    applyAim(camera, part, dt)
 end
 
-local function safeRender()
-    local ok, err = pcall(onRender)
+local function safeRender(dt)
+    local ok, err = pcall(onRender, dt)
     if ok then return end
 
     state.errorCount += 1
@@ -402,8 +474,7 @@ local function addToggle(parent, text, key, onChange)
         BackgroundTransparency = 1,
     }, parent)
 
-    label(row, text, 13, TEXT)
-        .Size = UDim2.new(1, -46, 1, 0)
+    label(row, text, 13, TEXT).Size = UDim2.new(1, -46, 1, 0)
 
     local pill = create("Frame", {
         Size = UDim2.new(0, 34, 0, 18),
@@ -588,7 +659,7 @@ local function addKeybind(parent, text, key)
         Font = Enum.Font.GothamMedium,
         Text = tostring(CONFIG[key]),
         TextColor3 = TEXT,
-        TextSize = 12,
+        TextSize = 11,
         AutoButtonColor = false,
     }, row)
     corner(button, 4)
@@ -605,7 +676,14 @@ local function addKeybind(parent, text, key)
 
     button.MouseButton1Click:Connect(function()
         state.awaitingBind = key
+        state.bindArmed = false
         apply()
+        -- the click that opened the bind must not become the bind
+        task.delay(0.2, function()
+            if state.awaitingBind == key then
+                state.bindArmed = true
+            end
+        end)
     end)
 
     table.insert(state.refreshers, apply)
@@ -644,10 +722,9 @@ local CONFIG_FILE = "ewanko_aimbot.json"
 
 local function saveConfig()
     if not writefile then return false end
-    local ok = pcall(function()
+    return pcall(function()
         writefile(CONFIG_FILE, HttpService:JSONEncode(CONFIG))
     end)
-    return ok
 end
 
 local function loadConfig()
@@ -709,7 +786,7 @@ local function buildWindow()
         BorderSizePixel = 0,
     }, window)
 
-    local title = create("TextLabel", {
+    create("TextLabel", {
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
         Text = "ewanko  " .. VERSION,
@@ -737,7 +814,6 @@ local function buildWindow()
         gui.Enabled = not gui.Enabled
     end)
 
-    -- drag
     titleBar.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
             state.dragging = true
@@ -764,7 +840,6 @@ local function buildWindow()
         end
     end)
 
-    -- tab column
     local tabs = create("Frame", {
         Size = UDim2.new(0, 112, 1, -30),
         Position = UDim2.new(0, 0, 0, 30),
@@ -846,18 +921,27 @@ local function buildWindow()
     makeTab("VISUAL", 2)
     makeTab("CONFIG", 3)
 
-    -- AIM
-    addToggle(aimPage, "Enabled", "AimEnabled")
-    addKeybind(aimPage, "Hold key", "KeyName")
+    addToggle(aimPage, "Enabled", "AimEnabled", function(value)
+        if not value then
+            state.aiming = false
+            state.target = nil
+        end
+    end)
+    addCycle(aimPage, "Aim mode", "AimMode", { "Hold", "Toggle" })
+    addKeybind(aimPage, "Bind", "KeyName")
     addSlider(aimPage, "FOV", "FOV", 20, 400, 1, "px")
     addSlider(aimPage, "Smooth", "Smooth", 0.05, 1, 0.05)
+    addCycle(aimPage, "Curve", "Curve", { "Linear", "Ease", "Human" })
+    addSlider(aimPage, "Ramp in", "RampIn", 0, 0.4, 0.01, " s")
+    addSlider(aimPage, "Max turn speed", "MaxTurnSpeed", 90, 3000, 10, " deg/s")
+    addSlider(aimPage, "Deadzone", "Deadzone", 0, 3, 0.1, " deg")
+    addSlider(aimPage, "Humanize", "Humanize", 0, 1, 0.05)
     addSlider(aimPage, "Max distance", "MaxDistance", 50, 1500, 25, " studs")
     addSlider(aimPage, "Prediction", "Prediction", 0, 0.4, 0.01, " s")
     addCycle(aimPage, "Aim part", "AimPart", { "Head", "UpperTorso", "HumanoidRootPart" })
     addToggle(aimPage, "Team check", "TeamCheck")
     addToggle(aimPage, "Wall check", "WallCheck")
 
-    -- VISUAL
     addToggle(visualPage, "FOV circle", "FOVCircle")
     addSlider(visualPage, "Circle thickness", "CircleThickness", 1, 4, 1, "px")
     addToggle(visualPage, "ESP", "ESP")
@@ -866,7 +950,6 @@ local function buildWindow()
     addToggle(visualPage, "ESP team check", "ESPTeamCheck")
     addSlider(visualPage, "ESP distance", "ESPMaxDistance", 50, 1500, 25, " studs")
 
-    -- CONFIG
     addButton(configPage, "Save config", function()
         local ok = saveConfig()
         print(ok and "[ewanko] config saved" or "[ewanko] no filesystem access")
@@ -899,7 +982,6 @@ local function buildWindow()
     label(configPage, "ewanko " .. VERSION .. " — " .. tostring(#Players:GetPlayers()) .. " players",
         11, MUTED).Size = UDim2.new(1, -8, 0, 18)
 
-    -- first tab active
     pages.AIM.Visible = true
     buttons.AIM.BackgroundColor3 = ACCENT
     buttons.AIM.TextColor3 = Color3.new(1, 1, 1)
@@ -913,28 +995,51 @@ end
 
 local gui = buildWindow()
 
+local function aimPressed()
+    if not CONFIG.AimEnabled then return end
+
+    if CONFIG.AimMode == "Toggle" then
+        state.aiming = not state.aiming
+    else
+        state.aiming = true
+    end
+
+    if state.aiming then
+        state.aimStarted = os.clock()
+    end
+end
+
+local function aimReleased()
+    if CONFIG.AimMode == "Hold" then
+        state.aiming = false
+    end
+end
+
 UserInputService.InputBegan:Connect(function(input, processed)
-    if state.awaitingBind and input.UserInputType == Enum.UserInputType.Keyboard then
-        CONFIG[state.awaitingBind] = input.KeyCode.Name
-        state.awaitingBind = nil
-        refreshAll()
+    if state.awaitingBind and state.bindArmed then
+        local bind = bindFromInput(input)
+        if bind then
+            CONFIG[state.awaitingBind] = bind
+            state.awaitingBind = nil
+            state.bindArmed = false
+            refreshAll()
+            return
+        end
+    end
+
+    if inputMatches(input, CONFIG.MenuKeyName) then
+        gui.Enabled = not gui.Enabled
         return
     end
 
-    if processed then return end
-
-    if input.KeyCode == keyCodeFor(CONFIG.MenuKeyName) and input.UserInputType == Enum.UserInputType.Keyboard then
-        gui.Enabled = not gui.Enabled
-    end
-
-    if input.KeyCode == keyCodeFor(CONFIG.KeyName) and CONFIG.AimEnabled then
-        state.aiming = true
+    if inputMatches(input, CONFIG.KeyName) then
+        aimPressed()
     end
 end)
 
 UserInputService.InputEnded:Connect(function(input)
-    if input.KeyCode == keyCodeFor(CONFIG.KeyName) then
-        state.aiming = false
+    if inputMatches(input, CONFIG.KeyName) then
+        aimReleased()
     end
 end)
 
@@ -973,5 +1078,5 @@ if isfile and isfile(CONFIG_FILE) then
     loadConfig()
 end
 
-print("[ewanko] " .. VERSION .. " bound — hold " .. CONFIG.KeyName
+print("[ewanko] " .. VERSION .. " bound — " .. CONFIG.AimMode .. " " .. CONFIG.KeyName
     .. " to aim, " .. CONFIG.MenuKeyName .. " for the menu.")
