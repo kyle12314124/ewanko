@@ -1410,15 +1410,25 @@ end
 -- page background, so the list reads as groups instead of one long column.
 local function section(parent, title)
     local frame = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 20),
+        Size = UDim2.new(1, -8, 0, 26),
         BackgroundTransparency = 1,
     }, parent)
 
-    label(frame, string.upper(title), 10, MUTED).Size = UDim2.new(0, 140, 0, 12)
+    local tick = create("Frame", {
+        Size = UDim2.new(0, 2, 0, 10),
+        Position = UDim2.new(0, 0, 0, 8),
+        BackgroundColor3 = ACCENT,
+        BorderSizePixel = 0,
+    }, frame)
+    corner(tick, 1)
+
+    local caption = label(frame, string.upper(title), 10, MUTED, UDim2.new(0, 8, 0, 7))
+    caption.Size = UDim2.new(0, 138, 0, 12)
+    caption.Font = Enum.Font.GothamBold
 
     local rule = create("Frame", {
         Size = UDim2.new(1, -150, 0, 1),
-        Position = UDim2.new(0, 150, 0.5, 0),
+        Position = UDim2.new(0, 150, 0, 12),
         BackgroundColor3 = LINE,
         BorderSizePixel = 0,
     }, frame)
@@ -1512,11 +1522,12 @@ local function addSlider(parent, text, key, min, max, step, suffix)
     }, parent)
     corner(row, 6)
 
-    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 5)).Size = UDim2.new(1, -90, 0, 16)
+    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 5)).Size = UDim2.new(1, -108, 0, 16)
 
+    -- the value chip has to hold "3000 deg/s" and "1500 studs" whole
     local chip = create("Frame", {
-        Size = UDim2.new(0, 64, 0, 18),
-        Position = UDim2.new(1, -74, 0, 4),
+        Size = UDim2.new(0, 82, 0, 18),
+        Position = UDim2.new(1, -92, 0, 4),
         BackgroundColor3 = PANEL_HI,
         BorderSizePixel = 0,
     }, row)
@@ -1638,17 +1649,17 @@ local function addCycle(parent, text, key, options)
     }, parent)
     corner(row, 6)
 
-    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0)).Size = UDim2.new(1, -124, 1, 0)
+    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0)).Size = UDim2.new(1, -134, 1, 0)
 
     local button = create("TextButton", {
-        Size = UDim2.new(0, 104, 0, 20),
-        Position = UDim2.new(1, -114, 0.5, -10),
+        Size = UDim2.new(0, 112, 0, 20),
+        Position = UDim2.new(1, -122, 0.5, -10),
         BackgroundColor3 = PANEL_HI,
         BorderSizePixel = 0,
         Font = Enum.Font.GothamMedium,
         Text = tostring(CONFIG[key]),
         TextColor3 = ACCENT_SOFT,
-        TextSize = 12,
+        TextSize = 11,
         AutoButtonColor = false,
     }, row)
     corner(button, 4)
@@ -1687,11 +1698,11 @@ local function addKeybind(parent, text, key)
     }, parent)
     corner(row, 6)
 
-    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0)).Size = UDim2.new(1, -124, 1, 0)
+    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0)).Size = UDim2.new(1, -134, 1, 0)
 
     local button = create("TextButton", {
-        Size = UDim2.new(0, 104, 0, 20),
-        Position = UDim2.new(1, -114, 0.5, -10),
+        Size = UDim2.new(0, 112, 0, 20),
+        Position = UDim2.new(1, -122, 0.5, -10),
         BackgroundColor3 = PANEL_HI,
         BorderSizePixel = 0,
         Font = Enum.Font.GothamMedium,
@@ -1944,6 +1955,40 @@ local function buildWindow()
         Size = UDim2.new(1, 0, 1, 0),
     }, versionChip)
 
+    -- live state pill: read the aim state off the chrome, not the FIX tab
+    local statusPill = create("Frame", {
+        Size = UDim2.new(0, 76, 0, 18),
+        Position = UDim2.new(1, -192, 0.5, -9),
+        BackgroundColor3 = Color3.fromRGB(24, 24, 32),
+        BorderSizePixel = 0,
+        ZIndex = 4,
+    }, titleBar)
+    corner(statusPill, 9)
+    stroke(statusPill, LINE, 1, 0.35)
+
+    local statusDot = create("Frame", {
+        Size = UDim2.new(0, 6, 0, 6),
+        Position = UDim2.new(0, 9, 0.5, -3),
+        BackgroundColor3 = MUTED,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, statusPill)
+    corner(statusDot, 3)
+
+    local statusText = create("TextLabel", {
+        BackgroundTransparency = 1,
+        Font = Enum.Font.GothamMedium,
+        Text = "IDLE",
+        TextColor3 = MUTED,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        Position = UDim2.new(0, 8, 0, 0),
+        Size = UDim2.new(1, -14, 1, 0),
+        ZIndex = 5,
+    }, statusPill)
+
+    state.statusLabel = { pill = statusPill, dot = statusDot, text = statusText }
+
     local close = create("TextButton", {
         Size = UDim2.new(0, 26, 0, 22),
         Position = UDim2.new(1, -34, 0.5, -11),
@@ -2019,17 +2064,27 @@ local function buildWindow()
     end)
 
     local tabs = create("Frame", {
-        Size = UDim2.new(0, 112, 1, -30),
-        Position = UDim2.new(0, 0, 0, 30),
+        Size = UDim2.new(0, 112, 1, -46),
+        Position = UDim2.new(0, 0, 0, 38),
         BackgroundColor3 = PANEL,
         BorderSizePixel = 0,
     }, window)
 
+    -- hairline rail: the strip and the page area were butting into each other
+    create("Frame", {
+        Size = UDim2.new(0, 1, 1, -38),
+        Position = UDim2.new(0, 112, 0, 38),
+        BackgroundColor3 = LINE,
+        BorderSizePixel = 0,
+    }, window)
+
     local content = create("Frame", {
-        Size = UDim2.new(1, -122, 1, -40),
-        Position = UDim2.new(0, 112, 0, 34),
+        Size = UDim2.new(1, -122, 1, -50),
+        Position = UDim2.new(0, 112, 0, 42),
         BackgroundTransparency = 1,
     }, window)
+
+    local TAB_IDLE = Color3.fromRGB(24, 24, 31)
 
     local pages = {}
     local buttons = {}
@@ -2063,30 +2118,59 @@ local function buildWindow()
 
     local function makeTab(name, order)
         local button = create("TextButton", {
-            Size = UDim2.new(1, -12, 0, 26),
-            Position = UDim2.new(0, 6, 0, 6 + (order - 1) * 30),
-            BackgroundColor3 = Color3.fromRGB(28, 28, 36),
+            Size = UDim2.new(1, -12, 0, 28),
+            Position = UDim2.new(0, 6, 0, 8 + (order - 1) * 32),
+            BackgroundColor3 = TAB_IDLE,
             BorderSizePixel = 0,
             Font = Enum.Font.GothamMedium,
             Text = name,
             TextColor3 = MUTED,
             TextSize = 12,
+            TextXAlignment = Enum.TextXAlignment.Left,
             AutoButtonColor = false,
         }, tabs)
         corner(button, 4)
+
+        create("UIPadding", { PaddingLeft = UDim.new(0, 11) }, button)
+
+        local bar = create("Frame", {
+            Size = UDim2.new(0, 2, 0, 0),
+            Position = UDim2.new(0, 0, 0.5, 0),
+            BackgroundColor3 = ACCENT,
+            BorderSizePixel = 0,
+        }, button)
+        corner(bar, 1)
+
+        -- active state rides on the button itself, so a hover can never
+        -- repaint the selected tab back to idle
+        local function activate(active)
+            button:SetAttribute("active", active)
+            button.BackgroundColor3 = active and PANEL_HI or TAB_IDLE
+            button.TextColor3 = active and TEXT or MUTED
+            bar.Size = UDim2.new(0, 2, active and 0.62 or 0, 0)
+        end
 
         button.MouseButton1Click:Connect(function()
             for pageName, page in pairs(pages) do
                 page.Visible = (pageName == name)
             end
-            for tabName, tabButton in pairs(buttons) do
-                tabButton.BackgroundColor3 = (tabName == name)
-                    and ACCENT
-                    or Color3.fromRGB(28, 28, 36)
-                tabButton.TextColor3 = (tabName == name) and Color3.new(1, 1, 1) or MUTED
+            for _, tabButton in pairs(buttons) do
+                tabButton.activate(tabButton == button)
             end
         end)
 
+        button.MouseEnter:Connect(function()
+            if not button:GetAttribute("active") then
+                tween(button, { BackgroundColor3 = PANEL_LO, TextColor3 = TEXT })
+            end
+        end)
+        button.MouseLeave:Connect(function()
+            if not button:GetAttribute("active") then
+                tween(button, { BackgroundColor3 = TAB_IDLE, TextColor3 = MUTED })
+            end
+        end)
+
+        button.activate = activate
         buttons[name] = button
         return button
     end
@@ -2101,6 +2185,7 @@ local function buildWindow()
     makeTab("FIX", 3)
     makeTab("CONFIG", 4)
 
+    section(aimPage, "core")
     addToggle(aimPage, "Enabled", "AimEnabled", function(value)
         if not value then
             state.aiming = false
@@ -2109,6 +2194,8 @@ local function buildWindow()
     end)
     addCycle(aimPage, "Aim mode", "AimMode", { "Hold", "Toggle" })
     addKeybind(aimPage, "Bind", "KeyName")
+
+    section(aimPage, "behaviour")
     addSlider(aimPage, "FOV", "FOV", 20, 400, 1, "px")
     addSlider(aimPage, "Smoothness", "Smoothness", 0, 100, 1)
     addCycle(aimPage, "Curve", "Curve", { "Linear", "Ease", "Human" })
@@ -2119,6 +2206,8 @@ local function buildWindow()
     addSlider(aimPage, "Max distance", "MaxDistance", 50, 1500, 25, " studs")
     addSlider(aimPage, "Prediction", "Prediction", 0, 0.4, 0.01, " s")
     addCycle(aimPage, "Aim part", "AimPart", { "Head", "UpperTorso", "HumanoidRootPart" })
+
+    section(aimPage, "filters")
     addToggle(aimPage, "Team check", "TeamCheck")
     addToggle(aimPage, "Wall check", "WallCheck")
     addToggle(aimPage, "Skip knocked/downed", "KnockCheck")
@@ -2127,8 +2216,11 @@ local function buildWindow()
     addToggle(aimPage, "Role check", "RoleCheck")
     addCycle(aimPage, "Target role", "TargetRoles", { "All", "Murderer", "Sheriff", "Innocent" })
 
+    section(visualPage, "reticle")
     addToggle(visualPage, "FOV circle", "FOVCircle")
     addSlider(visualPage, "Circle thickness", "CircleThickness", 1, 4, 1, "px")
+
+    section(visualPage, "esp")
     addToggle(visualPage, "ESP", "ESP")
     addToggle(visualPage, "ESP boxes", "ESPBoxes")
     addToggle(visualPage, "ESP names", "ESPNames")
@@ -2137,14 +2229,19 @@ local function buildWindow()
     addToggle(visualPage, "ESP hide knocked", "ESPKnockCheck")
     addToggle(visualPage, "ESP roles [M]/[S]", "ESPShowRoles")
     addSlider(visualPage, "ESP distance", "ESPMaxDistance", 50, 1500, 25, " studs")
+
+    section(visualPage, "items")
     addToggle(visualPage, "ESP dropped gun", "GunESP")
 
     -- FIX tab: the switches that make it work in games that fight the camera
+    section(compatibilityPage, "aim method")
     addCycle(compatibilityPage, "Aim method", "AimMethod", { "Auto", "Camera", "Mouse", "Subject" })
     addSlider(compatibilityPage, "Mouse gain", "MouseGain", 0.1, 3, 0.1)
     addSlider(compatibilityPage, "Mouse rate", "MouseRate", 10, 120, 5, " Hz")
     addSlider(compatibilityPage, "Mouse clamp", "MouseClamp", 5, 100, 5, " px")
     addToggle(compatibilityPage, "Auto fallback to mouse", "AutoFallback")
+
+    section(compatibilityPage, "stability")
     addToggle(compatibilityPage, "Safe mode", "SafeMode")
     addSlider(compatibilityPage, "Render priority", "RenderPriority", 199, 2000, 1)
     addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
@@ -2153,25 +2250,45 @@ local function buildWindow()
     addSlider(compatibilityPage, "Role rescan", "RoleRate", 0.1, 2, 0.1, " s")
     addSlider(compatibilityPage, "Gun rescan", "GunRate", 0.1, 2, 0.1, " s")
     addKeybind(compatibilityPage, "Panic key", "PanicKey")
+
+    section(compatibilityPage, "self test")
     addButton(compatibilityPage, "Test: camera write", nudgeCamera)
     addButton(compatibilityPage, "Test: mouse move", nudgeMouse)
+    addButton(compatibilityPage, "Print diagnostic report", printReport)
     addToggle(compatibilityPage, "UI watchdog", "UIWatchdog")
     addToggle(compatibilityPage, "Telemetry heartbeat", "Telemetry")
-    addButton(compatibilityPage, "Print diagnostic report", printReport)
 
-    state.debugLabels.camera = label(compatibilityPage, "camera: -", 11, MUTED)
-    state.debugLabels.aiming = label(compatibilityPage, "aiming: -", 11, MUTED)
-    state.debugLabels.candidates = label(compatibilityPage, "in FOV: -", 11, MUTED)
-    state.debugLabels.resolution = label(compatibilityPage, "viewport: -", 11, MUTED)
-    state.debugLabels.priority = label(compatibilityPage, "render priority: -", 11, MUTED)
-    state.debugLabels.method = label(compatibilityPage, "method: -", 11, MUTED)
-    state.debugLabels.roles = label(compatibilityPage, "roles: -", 11, MUTED)
-    state.debugLabels.error = label(compatibilityPage, "last error: -", 11, MUTED)
+    -- telemetry: one recessed console block, monospace, so six live values read
+    -- as a single instrument instead of a column of loose labels
+    section(compatibilityPage, "telemetry")
+    local console = create("Frame", {
+        Size = UDim2.new(1, -8, 0, 152),
+        BackgroundColor3 = PANEL_LO,
+        BorderSizePixel = 0,
+    }, compatibilityPage)
+    corner(console, 6)
+    stroke(console, LINE, 1, 0.35)
 
-    for _, debugLabel in pairs(state.debugLabels) do
-        debugLabel.Size = UDim2.new(1, -8, 0, 16)
+    create("UIListLayout", {
+        Padding = UDim.new(0, 2),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, console)
+
+    create("UIPadding", {
+        PaddingTop = UDim.new(0, 9),
+        PaddingLeft = UDim.new(0, 9),
+        PaddingRight = UDim.new(0, 9),
+    }, console)
+
+    for _, name in ipairs({ "camera", "aiming", "candidates", "resolution",
+        "priority", "method", "roles", "error" }) do
+        local debugRow = label(console, name .. ": -", 11, MUTED)
+        debugRow.Size = UDim2.new(1, 0, 0, 15)
+        debugRow.Font = Enum.Font.Code
+        state.debugLabels[name] = debugRow
     end
 
+    section(configPage, "profiles")
     addButton(configPage, "Save config", function()
         local ok = saveConfig()
         print(ok and "[ewanko] config saved" or "[ewanko] no filesystem access")
@@ -2195,18 +2312,23 @@ local function buildWindow()
         refreshAll()
     end)
 
+    section(configPage, "system")
     addKeybind(configPage, "Menu key", "MenuKeyName")
 
     addButton(configPage, "Unload", function()
         if getgenv().EwankoUnload then getgenv().EwankoUnload() end
     end)
 
-    label(configPage, "ewanko " .. VERSION .. " — " .. tostring(#Players:GetPlayers()) .. " players",
-        11, MUTED).Size = UDim2.new(1, -8, 0, 18)
+    local footer = label(configPage,
+        "ewanko " .. VERSION .. "  ·  " .. CONFIG.AimMethod .. "  ·  "
+            .. tostring(#Players:GetPlayers()) .. " players",
+        10, MUTED, UDim2.new(0, 0, 0, 4))
+    footer.Size = UDim2.new(1, -8, 0, 16)
+    footer.Font = Enum.Font.Code
+    footer.TextXAlignment = Enum.TextXAlignment.Center
 
     pages.AIM.Visible = true
-    buttons.AIM.BackgroundColor3 = ACCENT
-    buttons.AIM.TextColor3 = Color3.new(1, 1, 1)
+    buttons.AIM.activate(true)
 
     return gui
 end
@@ -2216,6 +2338,27 @@ end
 -- ======================================================================
 
 local gui = buildWindow()
+
+-- Chrome state, refreshed off the render path: no UI work inside the aim loop.
+task.spawn(function()
+    while alive do
+        task.wait(0.12)
+
+        local status = state.statusLabel
+        if status and gui and gui.Parent and status.text.Parent then
+            local armed = CONFIG.AimEnabled
+            local live  = armed and state.aiming
+
+            status.text.Text = live and "AIMING"
+                or (armed and (state.mouseMode and "MOUSE" or "ARMED"))
+                or "IDLE"
+
+            local colour = live and ACCENT or (armed and ACCENT_SOFT or MUTED)
+            status.text.TextColor3 = colour
+            status.dot.BackgroundColor3 = colour
+        end
+    end
+end)
 
 -- The game can hide, re-parent, or nuke unknown GUIs during a match. The
 -- watchdog re-asserts the window instead of letting it vanish for the session.
