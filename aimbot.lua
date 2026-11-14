@@ -1,4 +1,4 @@
--- Roblox aimbot — camera lock, FOV gate, visibility check, bone select
+-- Roblox aimbot v2 — throttled selection, isolated render, crash-hardened
 -- Loaded by loader.lua from raw.githubusercontent.com
 
 local Players          = game:GetService("Players")
@@ -7,16 +7,19 @@ local UserInputService = game:GetService("UserInputService")
 local Workspace        = game:GetService("Workspace")
 
 local CONFIG = {
-    Key           = Enum.KeyCode.Q,     -- hold to aim
-    FOV           = 140,                -- pixels from screen centre
-    Smooth        = 1,                  -- 1 = snap, 0.2 = heavy smoothing, 0 = off
-    MaxDistance   = 600,                -- studs
-    TeamCheck     = true,
-    WallCheck     = true,
-    AimPart       = "Head",             -- Head | UpperTorso | HumanoidRootPart
-    Prediction    = 0,                  -- seconds of velocity lead
-    ShowFOVCircle = true,
-    CircleColor   = Color3.fromRGB(255, 255, 255),
+    Key             = Enum.KeyCode.Q,   -- hold to aim
+    FOV             = 140,              -- pixels from screen centre
+    Smooth          = 1,                -- 1 = snap, 0.2 = smoothed, 0 = off
+    MaxDistance     = 600,              -- studs
+    TeamCheck       = true,
+    WallCheck       = true,
+    AimPart         = "Head",           -- Head | UpperTorso | HumanoidRootPart
+    Prediction      = 0,                -- seconds of velocity lead
+    ShowFOVCircle   = true,
+    CircleColor     = Color3.fromRGB(255, 255, 255),
+    SelectInterval  = 0.03,             -- seconds between target scans
+    MaxErrors       = 20,               -- render errors before self-unbind
+    RespectScriptable = true,           -- do not fight a game-owned camera
 }
 
 local localPlayer = Players.LocalPlayer
@@ -25,8 +28,11 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local aiming = false
+local aiming       = false
 local fovCircle
+local cachedTarget = nil
+local nextScan     = 0
+local errorCount   = 0
 
 local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
@@ -41,7 +47,7 @@ local function screenCentre(camera)
     return Vector2.new(viewport.X * 0.5, viewport.Y * 0.5)
 end
 
-if CONFIG.ShowFOVCircle then
+if CONFIG.ShowFOVCircle and typeof(Drawing) == "table" then
     local circleOk, circle = pcall(function()
         local c = Drawing.new("Circle")
         c.Thickness    = 1
@@ -144,9 +150,23 @@ local function onRender()
         fovCircle.Visible  = aiming
     end
 
-    if not aiming then return end
+    if not aiming then
+        cachedTarget = nil
+        return
+    end
 
-    local target = selectTarget()
+    if CONFIG.RespectScriptable
+        and camera.CameraType == Enum.CameraType.Scriptable then
+        return
+    end
+
+    local now = os.clock()
+    if now >= nextScan then
+        nextScan = now + CONFIG.SelectInterval
+        cachedTarget = selectTarget()
+    end
+
+    local target = cachedTarget
     if not target then return end
 
     local origin  = camera.CFrame.Position
@@ -160,11 +180,23 @@ local function onRender()
     end
 end
 
+local function safeRender()
+    local ok, err = pcall(onRender)
+    if ok then return end
+
+    errorCount += 1
+    if errorCount >= CONFIG.MaxErrors then
+        warn(("[aimbot] self-unbind after %d render errors: %s")
+            :format(errorCount, tostring(err)))
+        getgenv().AimbotUnload()
+    end
+end
+
 if getgenv().AimbotUnload then
     pcall(getgenv().AimbotUnload)
 end
 
-RunService:BindToRenderStep("AimbotLock", Enum.RenderPriority.Camera.Value + 1, onRender)
+RunService:BindToRenderStep("AimbotLock", Enum.RenderPriority.Camera.Value + 1, safeRender)
 
 UserInputService.InputBegan:Connect(function(input, processed)
     if processed then return end
@@ -176,6 +208,7 @@ end)
 UserInputService.InputEnded:Connect(function(input)
     if input.KeyCode == CONFIG.Key then
         aiming = false
+        cachedTarget = nil
     end
 end)
 
@@ -183,7 +216,9 @@ getgenv().AimbotUnload = function()
     RunService:UnbindFromRenderStep("AimbotLock")
     if fovCircle then
         pcall(function() fovCircle:Remove() end)
+        fovCircle = nil
     end
+    cachedTarget = nil
 end
 
-print("[aimbot] bound — hold Q to aim. unload: getgenv().AimbotUnload()")
+print("[aimbot] v2 bound — hold Q to aim. unload: getgenv().AimbotUnload()")

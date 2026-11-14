@@ -2,17 +2,18 @@
 -- Paste into the executor, execute, done.
 
 local OWNER, REPO, FILE = "kyle12314124", "ewanko", "aimbot.lua"
-local BRANCHES = { "main", "master" }
 local CACHE_BUST = "?v=" .. tostring(os.time())
+
+local MIRRORS = {
+    "https://raw.githubusercontent.com/%s/%s/main/%s%s",
+    "https://raw.githubusercontent.com/%s/%s/master/%s%s",
+    "https://cdn.jsdelivr.net/gh/%s/%s@main/%s%s",
+}
 
 local source, lastError
 
-for _, branch in ipairs(BRANCHES) do
-    local url = string.format(
-        "https://raw.githubusercontent.com/%s/%s/%s/%s%s",
-        OWNER, REPO, branch, FILE, CACHE_BUST
-    )
-
+for _, template in ipairs(MIRRORS) do
+    local url = string.format(template, OWNER, REPO, FILE, CACHE_BUST)
     local ok, body = pcall(game.HttpGet, game, url)
 
     if ok and type(body) == "string" and #body > 0
