@@ -1,5 +1,5 @@
--- ewanko aimbot v8 — crash hardening: throttled mouse aim, degraded render
--- fallback, UI watchdog, panic key, live diagnostics
+-- ewanko aimbot v9 — crash bisect build: safe boot, staged diagnostics,
+-- telemetry heartbeat, camera/mouse nudge tests
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
@@ -14,7 +14,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v8"
+local VERSION = "v9"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -23,7 +23,7 @@ local hasMouseMove = type(mousemoverel) == "function"
 
 local CONFIG = {
     -- aim
-    AimEnabled        = true,
+    AimEnabled        = false,      -- safe boot: nothing runs until you arm it
     AimMode           = "Hold",     -- Hold | Toggle
     KeyName           = "Q",        -- keyboard name or MouseButton1/2/3
     FOV               = 140,
@@ -48,9 +48,11 @@ local CONFIG = {
     MouseClamp        = 25,         -- max pixels moved per call
 
     -- stability
-    RenderPriority    = 1000,       -- lower this first if the client dies on aim
+    RenderPriority    = 200,        -- stock camera slot while bisecting; raise once it's proven
     SafeMode          = true,       -- no humanize, no Drawing churn, throttled mouse
     PanicKey          = "End",      -- always unloads, works even if the UI is gone
+    UIWatchdog        = false,      -- re-parent loop; off while bisecting, it masks the cause
+    Telemetry         = true,       -- heartbeat print, last line before a crash is the culprit
 
     -- compatibility
     RespectScriptable = false,      -- write the camera even if the game owns it
@@ -58,7 +60,7 @@ local CONFIG = {
     CollidableOnly    = true,       -- raycast ignores non-collidable decoration
 
     -- visuals
-    FOVCircle         = true,
+    FOVCircle         = false,
     CircleThickness   = 1,
     CircleColor       = { 255, 255, 255 },
 
@@ -106,6 +108,7 @@ local state = {
     nextMouse    = 0,
     uiClosed     = false,
     uiRebuilds   = 0,
+    stage        = "boot",
     debug        = { candidates = 0, blocked = 0, found = false },
     debugLabels  = {},
     lastDebug    = 0,
@@ -119,6 +122,15 @@ local MOUSE_BINDS = {
 
 local function rgb(triple)
     return Color3.fromRGB(triple[1], triple[2], triple[3])
+end
+
+-- NaN or infinity in a CFrame is a hard client crash, not a Luau error.
+local function isFinite(value)
+    return value == value and value ~= math.huge and value ~= -math.huge
+end
+
+local function isFiniteVector(vector)
+    return isFinite(vector.X) and isFinite(vector.Y) and isFinite(vector.Z)
 end
 
 local function inputMatches(input, bindName)
@@ -158,7 +170,11 @@ local function screenCentre(camera)
     return Vector2.new(viewport.X * 0.5, viewport.Y * 0.5)
 end
 
-if typeof(Drawing) == "table" then
+-- Drawing objects are created on demand: creating them at load is one of the
+-- things that kills a client before you ever press the aim key.
+local function ensureCircle()
+    if fovCircle or typeof(Drawing) ~= "table" then return fovCircle end
+
     local ok, circle = pcall(function()
         local c = Drawing.new("Circle")
         c.Filled       = false
@@ -169,7 +185,9 @@ if typeof(Drawing) == "table" then
         c.Thickness    = CONFIG.CircleThickness
         return c
     end)
+
     if ok then fovCircle = circle end
+    return fovCircle
 end
 
 local function aimPartFor(character)
@@ -263,13 +281,25 @@ local function selectTarget()
     return best
 end
 
-local function applyAim(camera, targetPart, dt)
-    local origin  = camera.CFrame.Position
-    local world   = targetPart.Position
+local function predictedWorld(targetPart)
+    local world = targetPart.Position
+    if not isFiniteVector(world) then return nil end
 
     if CONFIG.Prediction > 0 then
-        world += targetPart.AssemblyLinearVelocity * CONFIG.Prediction
+        local velocity = targetPart.AssemblyLinearVelocity
+        if not isFiniteVector(velocity) then return world end
+        if velocity.Magnitude > 1000 then velocity = velocity.Unit * 1000 end
+        world += velocity * CONFIG.Prediction
+        if not isFiniteVector(world) then return nil end
     end
+
+    return world
+end
+
+local function applyAim(camera, targetPart, dt)
+    local origin  = camera.CFrame.Position
+    local world   = predictedWorld(targetPart)
+    if not world then return end
 
     local desired = CFrame.lookAt(origin, world)
 
@@ -304,6 +334,8 @@ local function applyAim(camera, targetPart, dt)
     local allowed  = math.min(angle * alpha, CONFIG.MaxTurnSpeed * dt)
     local fraction = math.clamp(allowed / angle, 0, 1)
 
+    if not isFinite(fraction) then return end
+
     camera.CFrame = current:Lerp(desired, fraction)
 end
 
@@ -335,6 +367,7 @@ local function applyMouseAim(camera, targetPart, dt)
 
     local screen = camera:WorldToViewportPoint(targetPart.Position)
     if screen.Z <= 0 then return false end
+    if not (isFinite(screen.X) and isFinite(screen.Y)) then return false end
 
     local centre = screenCentre(camera)
     local tau    = 0.008 + (CONFIG.Smoothness / 100) ^ 2 * 0.9
@@ -500,16 +533,24 @@ local function onRender(dt)
 
     dt = math.min(dt or 1 / 60, 0.1)
 
+    state.stage = "debug"
     updateDebug(camera)
 
-    if fovCircle then
-        fovCircle.Position  = screenCentre(camera)
-        fovCircle.Radius    = CONFIG.FOV
-        fovCircle.Color     = rgb(CONFIG.CircleColor)
-        fovCircle.Thickness = CONFIG.CircleThickness
-        fovCircle.Visible   = CONFIG.FOVCircle and state.aiming
+    if CONFIG.FOVCircle then
+        state.stage = "fovcircle"
+        local circle = ensureCircle()
+        if circle then
+            circle.Position  = screenCentre(camera)
+            circle.Radius    = CONFIG.FOV
+            circle.Color     = rgb(CONFIG.CircleColor)
+            circle.Thickness = CONFIG.CircleThickness
+            circle.Visible   = state.aiming
+        end
+    elseif fovCircle then
+        fovCircle.Visible = false
     end
 
+    state.stage = "esp"
     updateESP(camera)
 
     if not state.aiming or not CONFIG.AimEnabled then
@@ -542,6 +583,7 @@ local function onRender(dt)
     local now = os.clock()
     if now >= state.nextScan then
         state.nextScan = now + CONFIG.SelectInterval
+        state.stage = "select"
         state.target = selectTarget()
     end
 
@@ -574,10 +616,12 @@ local function onRender(dt)
             return
         end
 
+        state.stage = "camera"
         applyAim(camera, part, dt)
         return
     end
 
+    state.stage = "mouse"
     applyMouseAim(camera, part, dt)
 end
 
@@ -951,12 +995,43 @@ local function printReport()
     print("errors:", state.errorCount, "safe mode:", CONFIG.SafeMode)
     print("method:", state.mouseMode and "mouse" or "camera",
         "stuck:", state.stuckFrames, "mousemoverel:", hasMouseMove)
+    print("stage:", state.stage)
     for key, value in pairs(CONFIG) do
         if type(value) ~= "table" then
             print(string.format("  %-18s %s", key, tostring(value)))
         end
     end
     print("=== end report ===")
+end
+
+-- Two clicks that separate the two possible crash sources. If the camera nudge
+-- kills the client, the game owns the camera. If the mouse nudge kills it, the
+-- executor's input hook is the problem. If neither does, it is the loop rate.
+local function nudgeCamera()
+    local camera = currentCamera()
+    if not camera then
+        print("[ewanko] nudge: no camera")
+        return
+    end
+
+    local ok, err = pcall(function()
+        camera.CFrame = camera.CFrame * CFrame.Angles(0, math.rad(3), 0)
+    end)
+
+    print(ok and "[ewanko] nudge: camera write accepted"
+        or ("[ewanko] nudge: camera write FAILED — " .. tostring(err)))
+end
+
+local function nudgeMouse()
+    if not hasMouseMove then
+        print("[ewanko] nudge: executor has no mousemoverel")
+        return
+    end
+
+    local ok, err = pcall(mousemoverel, 40, 0)
+
+    print(ok and "[ewanko] nudge: 40px mouse move accepted"
+        or ("[ewanko] nudge: mousemoverel FAILED — " .. tostring(err)))
 end
 
 -- ======================================================================
@@ -1177,6 +1252,10 @@ local function buildWindow()
     addToggle(compatibilityPage, "Force Custom camera", "ForceCustomCamera")
     addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
     addKeybind(compatibilityPage, "Panic key", "PanicKey")
+    addButton(compatibilityPage, "Test: camera write", nudgeCamera)
+    addButton(compatibilityPage, "Test: mouse move", nudgeMouse)
+    addToggle(compatibilityPage, "UI watchdog", "UIWatchdog")
+    addToggle(compatibilityPage, "Telemetry heartbeat", "Telemetry")
     addButton(compatibilityPage, "Print diagnostic report", printReport)
 
     state.debugLabels.camera = label(compatibilityPage, "camera: -", 11, MUTED)
@@ -1271,10 +1350,24 @@ local function ensureUI()
     state.uiClosed = false
 end
 
+if CONFIG.UIWatchdog then
+    task.spawn(function()
+        while alive do
+            task.wait(0.75)
+            pcall(ensureUI)
+        end
+    end)
+end
+
+-- Heartbeat: whatever is printed last before the client dies names the stage.
 task.spawn(function()
     while alive do
-        task.wait(0.75)
-        pcall(ensureUI)
+        task.wait(2)
+        if CONFIG.Telemetry then
+            print(("[ewanko] beat stage=%s mouse=%s aim=%s err=%d")
+                :format(tostring(state.stage), tostring(state.mouseMode),
+                    tostring(state.aiming), state.errorCount))
+        end
     end
 end)
 
