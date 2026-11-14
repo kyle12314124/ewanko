@@ -55,8 +55,6 @@ local CONFIG = {
     Telemetry         = true,       -- heartbeat print, last line before a crash is the culprit
 
     -- compatibility
-    RespectScriptable = false,      -- write the camera even if the game owns it
-    ForceCustomCamera = false,      -- switch CameraType to Custom while aiming
     CollidableOnly    = true,       -- raycast ignores non-collidable decoration
 
     -- visuals
@@ -162,6 +160,27 @@ local fovCircle
 
 local function currentCamera()
     return Workspace.CurrentCamera
+end
+
+-- Claiming the camera is the whole trick: a game camera script stops driving a
+-- Scriptable camera, so the write survives in a match with no input injection.
+local function claimCamera(camera)
+    if state.savedCamera == nil then
+        state.savedCamera = camera.CameraType
+    end
+    if camera.CameraType ~= Enum.CameraType.Scriptable then
+        camera.CameraType = Enum.CameraType.Scriptable
+    end
+end
+
+local function releaseCamera()
+    if state.savedCamera == nil then return end
+
+    local camera = currentCamera()
+    if camera then
+        pcall(function() camera.CameraType = state.savedCamera end)
+    end
+    state.savedCamera = nil
 end
 
 local function screenCentre(camera)
@@ -556,10 +575,7 @@ local function onRender(dt)
         state.target = nil
         state.prevAngle = nil
         state.stuckFrames = 0
-        return
-    end
-
-    if CONFIG.RespectScriptable and camera.CameraType == Enum.CameraType.Scriptable then
+        releaseCamera()
         return
     end
 
@@ -572,13 +588,6 @@ local function onRender(dt)
         state.mouseMode = true
     end
 
-    if CONFIG.ForceCustomCamera and camera.CameraType ~= Enum.CameraType.Custom then
-        if state.savedCamera == nil then
-            state.savedCamera = camera.CameraType
-        end
-        camera.CameraType = Enum.CameraType.Custom
-    end
-
     local now = os.clock()
     if now >= state.nextScan then
         state.nextScan = now + CONFIG.SelectInterval
@@ -589,6 +598,7 @@ local function onRender(dt)
     local part = state.target
     if not part or not part.Parent then
         state.target = nil
+        releaseCamera()
         return
     end
 
@@ -596,6 +606,8 @@ local function onRender(dt)
         or (CONFIG.AimMethod == "Auto" and state.mouseMode)
 
     if not useMouse then
+        claimCamera(camera)
+
         -- if the angle to target never shrinks, the write lands and is discarded
         local before = angleToTarget(camera, part.Position)
 
@@ -1244,8 +1256,6 @@ local function buildWindow()
     addToggle(compatibilityPage, "Auto fallback to mouse", "AutoFallback")
     addToggle(compatibilityPage, "Safe mode", "SafeMode")
     addSlider(compatibilityPage, "Render priority", "RenderPriority", 200, 2000, 50)
-    addToggle(compatibilityPage, "Respect Scriptable camera", "RespectScriptable")
-    addToggle(compatibilityPage, "Force Custom camera", "ForceCustomCamera")
     addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
     addKeybind(compatibilityPage, "Panic key", "PanicKey")
     addButton(compatibilityPage, "Test: camera write", nudgeCamera)
@@ -1380,14 +1390,14 @@ local function aimPressed()
     if state.aiming then
         state.aimStarted = os.clock()
     else
-        state.savedCamera = nil
+        releaseCamera()
     end
 end
 
 local function aimReleased()
     if CONFIG.AimMode == "Hold" then
         state.aiming = false
-        state.savedCamera = nil
+        releaseCamera()
     end
 end
 
@@ -1452,6 +1462,7 @@ RunService:BindToRenderStep("EwankoAimbot", CONFIG.RenderPriority, safeRender)
 getgenv().EwankoUnload = function()
     alive = false
     pcall(function() RunService:UnbindFromRenderStep("EwankoAimbot") end)
+    releaseCamera()
     clearESP()
     if fovCircle then
         pcall(function() fovCircle:Remove() end)
