@@ -95,11 +95,6 @@ local CONFIG = {
 
     -- menu
     MenuKeyName       = "RightShift",
-
-    -- streamer mode: one press kills every visual this script draws
-    StealthKey        = "F2",
-    AutoHideOnBlur    = true,       -- hide the moment the window loses focus
-    StealthOnStart    = false,      -- boot hidden, reveal with StealthKey
 }
 
 local DEFAULTS = {}
@@ -2000,21 +1995,6 @@ local function buildWindow()
         ZIndex = 4,
     }, titleBar)
     corner(close, 5)
-
-    -- streamer chip: one click hides the window, the ESP and the FOV circle
-    local streamChip = create("TextButton", {
-        Size = UDim2.new(0, 62, 0, 18),
-        Position = UDim2.new(1, -104, 0.5, -9),
-        BackgroundColor3 = Color3.fromRGB(40, 40, 52),
-        BorderSizePixel = 0,
-        Font = Enum.Font.GothamMedium,
-        Text = "STREAM",
-        TextColor3 = MUTED,
-        TextSize = 10,
-        AutoButtonColor = false,
-        ZIndex = 4,
-    }, titleBar)
-    corner(streamChip, 4)
 
     close.MouseButton1Click:Connect(function()
         gui.Enabled = not gui.Enabled
