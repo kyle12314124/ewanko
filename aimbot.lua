@@ -1,5 +1,5 @@
--- ewanko aimbot v12 — camera write at RenderPriority.Last plus a RenderStepped
--- re-assert, Subject mode, per-frame mouse fallback
+-- ewanko aimbot v13 — players and NPCs share one target list, knock/down check,
+-- camera write at RenderPriority.Last, per-frame mouse fallback
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
@@ -14,7 +14,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v12"
+local VERSION = "v13"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -40,8 +40,14 @@ local CONFIG = {
     Prediction        = 0,
     SelectInterval    = 0.03,
 
+    -- targets
+    KnockCheck        = true,       -- skip players/NPCs in a downed or ragdoll state
+    NPCs              = true,       -- scan Workspace for non-player Humanoids
+    NPCRate           = 0.4,        -- seconds between NPC rescans
+    NPCDepth          = 2,          -- how deep the Workspace walk goes
+
     -- aim method: mouse mode drives the game's own camera instead of writing CFrames
-    AimMethod         = "Camera",   -- Auto | Camera | Mouse
+    AimMethod         = "Camera",   -- Auto | Camera | Mouse | Subject
     MouseGain         = 1.0,
     AutoFallback      = false,      -- off by default: input injection is the crash vector
     MouseRate         = 60,         -- mousemoverel calls per second (60 = every frame)
@@ -64,10 +70,12 @@ local CONFIG = {
 
     ESP               = false,
     ESPTeamCheck      = true,
+    ESPKnockCheck     = false,      -- false = knocked bodies stay on screen
     ESPMaxDistance    = 500,
     ESPBoxes          = true,
     ESPNames          = true,
     ESPColor          = { 255, 77, 141 },
+    ESPColorNPC       = { 255, 190, 60 },
 
     -- menu
     MenuKeyName       = "RightShift",
@@ -107,10 +115,12 @@ local state = {
     prevAngle    = nil,
     stuckFrames  = 0,
     mouseAccum   = 0,
+    npcCache     = {},
+    npcNext      = 0,
     uiClosed     = false,
     uiRebuilds   = 0,
     stage        = "boot",
-    debug        = { candidates = 0, blocked = 0, found = false },
+    debug        = { candidates = 0, blocked = 0, knocked = 0, npcs = 0, found = false },
     debugLabels  = {},
     lastDebug    = 0,
 }
@@ -254,16 +264,154 @@ local function isEnemy(player)
     return player.Team ~= localPlayer.Team
 end
 
-local function isValidTarget(player)
-    if not isEnemy(player) then return false end
+-- ======================================================================
+-- targets
+-- ======================================================================
 
-    local character = player.Character
-    if not character then return false end
+-- Names games give the downed state: an attribute on the character, or a
+-- BoolValue child. Both are cheap to read, unlike a recursive name search.
+local KNOCK_NAMES = {
+    Knocked = true, Knock = true, Downed = true, Down = true,
+    Ragdoll = true, IsRagdoll = true, Ragdolled = true,
+    Incapacitated = true, KO = true, KOd = true, Stunned = true,
+    Grabbed = true, DBNO = true, IsDead = true, Dead = true,
+}
 
-    local humanoid = character:FindFirstChildOfClass("Humanoid")
-    if not humanoid or humanoid.Health <= 0 then return false end
+local knockCache   = {}
+local knockPruneAt = 0
 
-    return true
+local function knockFlagsSet(character)
+    for name in pairs(KNOCK_NAMES) do
+        if character:GetAttribute(name) == true then return true end
+    end
+
+    for _, child in ipairs(character:GetChildren()) do
+        if child:IsA("BoolValue") and child.Value and KNOCK_NAMES[child.Name] then
+            return true
+        end
+    end
+
+    return false
+end
+
+-- Downed detection, cached for 150 ms: this runs from both the aim loop and the
+-- ESP loop, and the attribute/child scan is the expensive half of it.
+local function isKnocked(humanoid, character)
+    local now    = os.clock()
+    local cached = knockCache[character]
+    if cached and now - cached.at < 0.15 then
+        return cached.knocked
+    end
+
+    local knocked = false
+
+    if humanoid.Health <= 0
+        or humanoid.PlatformStand
+        or humanoid.Sit then
+        knocked = true
+    else
+        local ok, humanoidState = pcall(function() return humanoid:GetState() end)
+        if ok and (humanoidState == Enum.HumanoidStateType.Dead
+            or humanoidState == Enum.HumanoidStateType.Physics
+            or humanoidState == Enum.HumanoidStateType.FallingDown
+            or humanoidState == Enum.HumanoidStateType.Ragdoll) then
+            knocked = true
+        elseif knockFlagsSet(character) then
+            knocked = true
+        end
+    end
+
+    knockCache[character] = { at = now, knocked = knocked }
+
+    if now >= knockPruneAt then
+        knockPruneAt = now + 10
+        local pruned = {}
+        for key, entry in pairs(knockCache) do
+            if key.Parent and now - entry.at < 5 then pruned[key] = entry end
+        end
+        knockCache = pruned
+    end
+
+    return knocked
+end
+
+-- NPC scan: depth-limited walk of Workspace for Models with a Humanoid that no
+-- player owns. Throttled, because GetChildren over a whole place is not a
+-- per-frame operation.
+local function collectNPCs()
+    local found = {}
+
+    local function walk(container, depth)
+        if depth > CONFIG.NPCDepth then return end
+
+        for _, child in ipairs(container:GetChildren()) do
+            if child:IsA("Model") then
+                if child:FindFirstChildOfClass("Humanoid") then
+                    if not Players:GetPlayerFromCharacter(child) then
+                        table.insert(found, child)
+                    end
+                else
+                    walk(child, depth + 1)
+                end
+            elseif child:IsA("Folder") then
+                walk(child, depth + 1)
+            end
+        end
+    end
+
+    pcall(function() walk(Workspace, 0) end)
+    return found
+end
+
+-- One list feeds both the aim and the ESP, so a name that shows on screen is a
+-- name the aim can select. `enemy` is team state, not a filter: ESP decides
+-- whether it cares, aim always does.
+local function collectTargets()
+    local now = os.clock()
+    if CONFIG.NPCs and now >= state.npcNext then
+        state.npcNext  = now + math.max(CONFIG.NPCRate, 0.1)
+        state.npcCache = collectNPCs()
+    end
+
+    local targets = {}
+
+    for _, player in ipairs(Players:GetPlayers()) do
+        if player ~= localPlayer then
+            local character = player.Character
+            local humanoid  = character and character:FindFirstChildOfClass("Humanoid")
+
+            if character and humanoid then
+                targets[#targets + 1] = {
+                    character = character,
+                    humanoid  = humanoid,
+                    name      = player.Name,
+                    player    = player,
+                    isNPC     = false,
+                    enemy     = isEnemy(player),
+                }
+            end
+        end
+    end
+
+    if CONFIG.NPCs then
+        for _, character in ipairs(state.npcCache) do
+            if character.Parent then
+                local humanoid = character:FindFirstChildOfClass("Humanoid")
+                if humanoid then
+                    targets[#targets + 1] = {
+                        character = character,
+                        humanoid  = humanoid,
+                        name      = character.Name,
+                        player    = nil,
+                        isNPC     = true,
+                        enemy     = true,
+                    }
+                end
+            end
+        end
+    end
+
+    return targets
 end
 
 local function selectTarget()
@@ -278,13 +426,19 @@ local function selectTarget()
     local debug = state.debug
     debug.candidates = 0
     debug.blocked    = 0
+    debug.knocked    = 0
+    debug.npcs       = 0
     debug.found      = false
 
     rayParams.RespectCanCollide = CONFIG.CollidableOnly
 
-    for _, player in ipairs(Players:GetPlayers()) do
-        if isValidTarget(player) then
-            local character = player.Character
+    for _, target in ipairs(collectTargets()) do
+        if target.isNPC then debug.npcs += 1 end
+
+        local character = target.character
+        local humanoid  = target.humanoid
+
+        if target.enemy and humanoid.Health > 0 then
             local part = aimPartFor(character)
 
             if part then
@@ -303,7 +457,9 @@ local function selectTarget()
                         if offset <= CONFIG.FOV then
                             debug.candidates += 1
 
-                            if offset < bestScore then
+                            if CONFIG.KnockCheck and isKnocked(humanoid, character) then
+                                debug.knocked += 1
+                            elseif offset < bestScore then
                                 local clear = true
 
                                 if CONFIG.WallCheck then
@@ -508,58 +664,73 @@ local function updateESP(camera)
         return
     end
 
-    local origin = camera.CFrame.Position
-    local colour = rgb(CONFIG.ESPColor)
+    local origin       = camera.CFrame.Position
+    local playerColour = rgb(CONFIG.ESPColor)
+    local npcColour    = rgb(CONFIG.ESPColorNPC)
+    local seen         = {}
 
-    for _, player in ipairs(Players:GetPlayers()) do
-        local entry = state.esp[player]
+    for _, target in ipairs(collectTargets()) do
+        local character = target.character
+        local humanoid  = target.humanoid
+        local head = character:FindFirstChild("Head")
+        local root = character:FindFirstChild("HumanoidRootPart")
 
-        local show = false
-        if player ~= localPlayer then
-            local character = player.Character
-            local head  = character and character:FindFirstChild("Head")
-            local root  = character and character:FindFirstChild("HumanoidRootPart")
-            local humanoid = character and character:FindFirstChildOfClass("Humanoid")
-            local enemy = (not CONFIG.ESPTeamCheck)
-                or player.Team == nil
-                or localPlayer.Team == nil
-                or player.Team ~= localPlayer.Team
+        local allowed = target.isNPC or (not CONFIG.ESPTeamCheck) or target.enemy
+        local show    = false
 
-            if head and root and humanoid and humanoid.Health > 0 and enemy then
-                local distance = (root.Position - origin).Magnitude
+        if head and root and allowed and humanoid.Health > 0
+            and not (CONFIG.ESPKnockCheck and isKnocked(humanoid, character)) then
+            local distance = (root.Position - origin).Magnitude
 
-                if distance <= CONFIG.ESPMaxDistance then
-                    local top, topOk    = camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.6, 0))
-                    local bottom, botOk = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 2.6, 0))
+            if distance <= CONFIG.ESPMaxDistance then
+                local top, topOk    = camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.6, 0))
+                local bottom, botOk = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 2.6, 0))
 
-                    if topOk and botOk and top.Z > 0 and bottom.Z > 0 then
-                        if not entry then
-                            entry = newESPEntry()
-                            state.esp[player] = entry
-                        end
+                if topOk and botOk and top.Z > 0 and bottom.Z > 0 then
+                    local entry = state.esp[character]
+                    if not entry then
+                        entry = newESPEntry()
+                        state.esp[character] = entry
+                    end
 
-                        if entry then
-                            local height = math.abs(bottom.Y - top.Y)
-                            local width  = height * 0.6
+                    if entry then
+                        local height = math.abs(bottom.Y - top.Y)
+                        local width  = height * 0.6
+                        local colour = target.isNPC and npcColour or playerColour
 
-                            entry.box.Position = Vector2.new(top.X - width * 0.5, top.Y)
-                            entry.box.Size     = Vector2.new(width, height)
-                            entry.box.Color    = colour
-                            entry.box.Visible  = CONFIG.ESPBoxes
+                        entry.box.Position = Vector2.new(top.X - width * 0.5, top.Y)
+                        entry.box.Size     = Vector2.new(width, height)
+                        entry.box.Color    = colour
+                        entry.box.Visible  = CONFIG.ESPBoxes
 
-                            entry.name.Text     = player.Name
-                            entry.name.Position = Vector2.new(top.X, top.Y - 16)
-                            entry.name.Color    = colour
-                            entry.name.Visible  = CONFIG.ESPNames
+                        entry.name.Text     = target.name
+                        entry.name.Position = Vector2.new(top.X, top.Y - 16)
+                        entry.name.Color    = colour
+                        entry.name.Visible  = CONFIG.ESPNames
 
-                            show = CONFIG.ESPBoxes or CONFIG.ESPNames
-                        end
+                        seen[character] = true
+                        show = CONFIG.ESPBoxes or CONFIG.ESPNames
                     end
                 end
             end
         end
 
-        if not show then hideESP(entry) end
+        if not show then hideESP(state.esp[character]) end
+    end
+
+    -- entries key off the character model now, not the player, so NPCs get the
+    -- same treatment and nothing leaks when a body leaves the world
+    for character, entry in pairs(state.esp) do
+        if not seen[character] then
+            hideESP(entry)
+            if not character.Parent then
+                pcall(function()
+                    entry.box:Remove()
+                    entry.name:Remove()
+                end)
+                state.esp[character] = nil
+            end
+        end
     end
 end
 
@@ -582,6 +753,8 @@ local function updateDebug(camera)
         .. "  target: " .. tostring(debug.found)
     labels.candidates.Text = "in FOV: " .. tostring(debug.candidates)
         .. "  wall-blocked: " .. tostring(debug.blocked)
+        .. "  knocked: " .. tostring(debug.knocked)
+        .. "  npcs: " .. tostring(debug.npcs)
     labels.resolution.Text = ("viewport: %d x %d"):format(
         math.floor(camera.ViewportSize.X), math.floor(camera.ViewportSize.Y))
     labels.priority.Text = "render priority: " .. tostring(CONFIG.RenderPriority)
@@ -1061,7 +1234,8 @@ local function printReport()
     print("camera:", camera and camera.CameraType or "nil")
     print("viewport:", camera and tostring(camera.ViewportSize) or "nil")
     print("aiming:", state.aiming, "target:", state.debug.found)
-    print("in FOV:", state.debug.candidates, "wall-blocked:", state.debug.blocked)
+    print("in FOV:", state.debug.candidates, "wall-blocked:", state.debug.blocked,
+        "knocked:", state.debug.knocked, "npcs:", state.debug.npcs)
     print("players:", #Players:GetPlayers())
     print("last error:", state.lastError)
     print("errors:", state.errorCount, "safe mode:", CONFIG.SafeMode)
@@ -1303,6 +1477,8 @@ local function buildWindow()
     addCycle(aimPage, "Aim part", "AimPart", { "Head", "UpperTorso", "HumanoidRootPart" })
     addToggle(aimPage, "Team check", "TeamCheck")
     addToggle(aimPage, "Wall check", "WallCheck")
+    addToggle(aimPage, "Skip knocked/downed", "KnockCheck")
+    addToggle(aimPage, "Aim at NPCs", "NPCs", refreshAll)
 
     addToggle(visualPage, "FOV circle", "FOVCircle")
     addSlider(visualPage, "Circle thickness", "CircleThickness", 1, 4, 1, "px")
@@ -1310,6 +1486,8 @@ local function buildWindow()
     addToggle(visualPage, "ESP boxes", "ESPBoxes")
     addToggle(visualPage, "ESP names", "ESPNames")
     addToggle(visualPage, "ESP team check", "ESPTeamCheck")
+    addToggle(visualPage, "ESP NPCs", "NPCs", refreshAll)
+    addToggle(visualPage, "ESP hide knocked", "ESPKnockCheck")
     addSlider(visualPage, "ESP distance", "ESPMaxDistance", 50, 1500, 25, " studs")
 
     -- FIX tab: the switches that make it work in games that fight the camera
@@ -1321,6 +1499,8 @@ local function buildWindow()
     addToggle(compatibilityPage, "Safe mode", "SafeMode")
     addSlider(compatibilityPage, "Render priority", "RenderPriority", 199, 2000, 1)
     addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
+    addSlider(compatibilityPage, "NPC rescan", "NPCRate", 0.1, 2, 0.1, " s")
+    addSlider(compatibilityPage, "NPC scan depth", "NPCDepth", 1, 4, 1)
     addKeybind(compatibilityPage, "Panic key", "PanicKey")
     addButton(compatibilityPage, "Test: camera write", nudgeCamera)
     addButton(compatibilityPage, "Test: mouse move", nudgeMouse)
@@ -1503,13 +1683,14 @@ UserInputService.InputEnded:Connect(function(input)
 end)
 
 Players.PlayerRemoving:Connect(function(player)
-    local entry = state.esp[player]
+    local character = player.Character
+    local entry = character and state.esp[character]
     if entry then
         pcall(function()
             entry.box:Remove()
             entry.name:Remove()
         end)
-        state.esp[player] = nil
+        state.esp[character] = nil
     end
 end)
 
