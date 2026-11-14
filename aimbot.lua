@@ -1,6 +1,6 @@
--- ewanko aimbot v14 — players and NPCs share one target list, knock/down check,
--- role detection (murderer / sheriff) and dropped-gun ESP, camera write at
--- RenderPriority.Last, per-frame mouse fallback
+-- ewanko aimbot v16 — players, NPCs, mobs and bots share one target list,
+-- knock/down check, role detection (murderer / sheriff) and dropped-gun ESP,
+-- camera write at RenderPriority.Last, per-frame mouse fallback, streamer mode
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
@@ -8,6 +8,7 @@ local RunService       = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local HttpService      = game:GetService("HttpService")
 local Workspace        = game:GetService("Workspace")
+local TweenService     = game:GetService("TweenService")
 
 local localPlayer = Players.LocalPlayer
 if not localPlayer then
@@ -15,7 +16,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v14"
+local VERSION = "v16"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -43,8 +44,9 @@ local CONFIG = {
 
     -- targets
     KnockCheck        = true,       -- skip players/NPCs in a downed or ragdoll state
-    NPCs              = true,       -- scan Workspace for non-player Humanoids
-    NPCRate           = 0.4,        -- seconds between NPC rescans
+    NPCs              = true,       -- scan Workspace for non-player actors
+    Mobs              = true,       -- also accept Humanoid-less models: mobs, bots, dummies
+    NPCRate           = 0.4,        -- seconds between actor rescans
     NPCDepth          = 2,          -- how deep the Workspace walk goes
 
     -- aim method: mouse mode drives the game's own camera instead of writing CFrames
@@ -93,6 +95,11 @@ local CONFIG = {
 
     -- menu
     MenuKeyName       = "RightShift",
+
+    -- streamer mode: one press kills every visual this script draws
+    StealthKey        = "F2",
+    AutoHideOnBlur    = true,       -- hide the moment the window loses focus
+    StealthOnStart    = false,      -- boot hidden, reveal with StealthKey
 }
 
 local DEFAULTS = {}
@@ -136,8 +143,11 @@ local state = {
     gunESP       = {},
     uiClosed     = false,
     uiRebuilds   = 0,
+    stealth      = false,
+    statusLabel  = nil,
+    lastDt       = 1 / 60,
     stage        = "boot",
-    debug        = { candidates = 0, blocked = 0, knocked = 0, npcs = 0,
+    debug        = { candidates = 0, blocked = 0, knocked = 0, npcs = 0, mobs = 0,
                      murderer = 0, sheriff = 0, guns = 0, found = false },
     debugLabels  = {},
     lastDebug    = 0,
@@ -514,10 +524,88 @@ local function currentGuns()
     return state.gunCache
 end
 
--- NPC scan: depth-limited walk of Workspace for Models with a Humanoid that no
--- player owns. Throttled, because GetChildren over a whole place is not a
--- per-frame operation.
-local function collectNPCs()
+-- ======================================================================
+-- actors (NPCs, mobs, bots)
+-- ======================================================================
+
+-- A target is anything that stands up and can be hit. Three shapes cover the
+-- field: a Model with a Humanoid (players, NPCs), a Humanoid-less rig (dummy,
+-- bot, animated mob), and a part-based mob with an exposed health value.
+local MOB_KEYWORDS = {
+    "mob", "bot", "npc", "enemy", "zombie", "guard", "soldier", "monster",
+    "creature", "dummy", "hostile", "unit", "troop", "raider", "bandit",
+    "slime", "skeleton", "demon", "goblin", "brute", "thug", "boss", "minion",
+}
+
+local HEALTH_ATTRIBUTES = { "Health", "health", "HP", "Hp", "hp", "CurrentHealth", "currentHealth" }
+local HEALTH_CHILDREN   = { "Health", "HP", "HealthValue", "HealthBar" }
+
+local HEAD_NAMES = { "Head", "head", "Chest", "Core", "UpperTorso", "Torso" }
+local ROOT_NAMES = { "HumanoidRootPart", "Torso", "UpperTorso", "RootPart", "Root" }
+
+local function firstPart(model, names)
+    for _, name in ipairs(names) do
+        local inst = model:FindFirstChild(name)
+        if inst and inst:IsA("BasePart") then return inst end
+    end
+    return nil
+end
+
+-- Aim point for a model that has no Humanoid: a named body part if the rig has
+-- one, otherwise the primary part, otherwise the first part found. The descendant
+-- walk is capped so a 400-part mob does not cost a full traversal.
+local function actorPart(model)
+    local part = firstPart(model, HEAD_NAMES) or firstPart(model, ROOT_NAMES)
+    if part then return part end
+    if model.PrimaryPart then return model.PrimaryPart end
+
+    local scanned = 0
+    for _, descendant in ipairs(model:GetDescendants()) do
+        scanned += 1
+        if descendant:IsA("BasePart") then return descendant end
+        if scanned >= 60 then break end
+    end
+
+    return nil
+end
+
+local function actorHealth(model)
+    for _, name in ipairs(HEALTH_ATTRIBUTES) do
+        local value = model:GetAttribute(name)
+        if type(value) == "number" then return value end
+    end
+
+    for _, name in ipairs(HEALTH_CHILDREN) do
+        local child = model:FindFirstChild(name)
+        if child and (child:IsA("IntValue") or child:IsA("NumberValue")) then
+            return child.Value
+        end
+    end
+
+    return nil
+end
+
+local function nameLooksLikeActor(name)
+    local lower = name:lower()
+    for _, keyword in ipairs(MOB_KEYWORDS) do
+        if lower:find(keyword, 1, true) then return true end
+    end
+    return false
+end
+
+-- Acceptance for a Humanoid-less model: a name that reads like a mob, an exposed
+-- health value, or the Head-plus-root shape of an animated rig. That last one is
+-- what catches dummies and bots that carry no Humanoid at all.
+local function actorAccepted(model)
+    if nameLooksLikeActor(model.Name) then return true end
+    if actorHealth(model) then return true end
+    if firstPart(model, { "Head" }) and firstPart(model, ROOT_NAMES) then return true end
+    return false
+end
+
+-- Actor scan: depth-limited walk of Workspace for anything no player owns.
+-- Throttled, because GetChildren over a whole place is not a per-frame operation.
+local function collectActors()
     local found = {}
 
     local function walk(container, depth)
@@ -525,12 +613,30 @@ local function collectNPCs()
 
         for _, child in ipairs(container:GetChildren()) do
             if child:IsA("Model") then
-                if child:FindFirstChildOfClass("Humanoid") then
-                    if not Players:GetPlayerFromCharacter(child) then
-                        table.insert(found, child)
+                if not Players:GetPlayerFromCharacter(child) then
+                    local humanoid = child:FindFirstChildOfClass("Humanoid")
+
+                    if humanoid then
+                        found[#found + 1] = {
+                            model    = child,
+                            humanoid = humanoid,
+                            kind     = "npc",
+                        }
+                        walk(child, depth + 1)
+                    elseif CONFIG.Mobs and actorAccepted(child) then
+                        local part = actorPart(child)
+                        if part then
+                            found[#found + 1] = {
+                                model    = child,
+                                humanoid = nil,
+                                part     = part,
+                                kind     = "mob",
+                            }
+                        end
+                        walk(child, depth + 1)
+                    else
+                        walk(child, depth + 1)
                     end
-                else
-                    walk(child, depth + 1)
                 end
             elseif child:IsA("Folder") then
                 walk(child, depth + 1)
@@ -549,7 +655,7 @@ local function collectTargets()
     local now = os.clock()
     if CONFIG.NPCs and now >= state.npcNext then
         state.npcNext  = now + math.max(CONFIG.NPCRate, 0.1)
-        state.npcCache = collectNPCs()
+        state.npcCache = collectActors()
     end
 
     local targets = {}
@@ -563,29 +669,44 @@ local function collectTargets()
                 targets[#targets + 1] = {
                     character = character,
                     humanoid  = humanoid,
+                    part      = nil,          -- resolved per scan: AimPart can change
                     name      = player.Name,
                     player    = player,
                     isNPC     = false,
                     role      = roleOf(player),
                     enemy     = isEnemy(player),
+                    kind      = "player",
                 }
             end
         end
     end
 
     if CONFIG.NPCs then
-        for _, character in ipairs(state.npcCache) do
-            if character.Parent then
-                local humanoid = character:FindFirstChildOfClass("Humanoid")
-                if humanoid then
+        for _, actor in ipairs(state.npcCache) do
+            local character = actor.model
+
+            if character.Parent and (actor.kind ~= "mob" or CONFIG.Mobs) then
+                local humanoid = actor.humanoid
+                local part
+
+                if humanoid and humanoid.Parent then
+                    part = nil                -- same: AimPart decides
+                else
+                    humanoid = nil            -- the rig lost its Humanoid, retarget the parts
+                    part = actorPart(character)
+                end
+
+                if humanoid or part then
                     targets[#targets + 1] = {
                         character = character,
                         humanoid  = humanoid,
+                        part      = part,
                         name      = character.Name,
                         player    = nil,
                         isNPC     = true,
                         role      = nil,
                         enemy     = true,
+                        kind      = humanoid and "npc" or "mob",
                     }
                 end
             end
@@ -609,6 +730,7 @@ local function selectTarget()
     debug.blocked    = 0
     debug.knocked    = 0
     debug.npcs       = 0
+    debug.mobs       = 0
     debug.found      = false
 
     rayParams.RespectCanCollide = CONFIG.CollidableOnly
@@ -616,10 +738,17 @@ local function selectTarget()
     local wanted = CONFIG.TargetRoles
 
     for _, target in ipairs(collectTargets()) do
-        if target.isNPC then debug.npcs += 1 end
+        if target.isNPC then
+            debug.npcs += 1
+            if target.kind == "mob" then debug.mobs += 1 end
+        end
 
         local character = target.character
         local humanoid  = target.humanoid
+
+        -- a Humanoid carries its own health; a mob rig exposes it as an
+        -- attribute or value, and a rig with neither is assumed alive
+        local health = humanoid and humanoid.Health or (actorHealth(character) or 1)
 
         -- the role filter applies to players only: an NPC has no role to match
         local roleOk = target.isNPC
@@ -629,8 +758,8 @@ local function selectTarget()
             or (wanted == "Innocent" and target.role ~= "Murderer"
                 and target.role ~= "Sheriff")
 
-        if roleOk and target.enemy and humanoid.Health > 0 then
-            local part = aimPartFor(character)
+        if roleOk and target.enemy and health > 0 then
+            local part = target.part or aimPartFor(character)
 
             if part then
                 local world = part.Position
@@ -648,7 +777,7 @@ local function selectTarget()
                         if offset <= CONFIG.FOV then
                             debug.candidates += 1
 
-                            if CONFIG.KnockCheck and isKnocked(humanoid, character) then
+                            if CONFIG.KnockCheck and humanoid and isKnocked(humanoid, character) then
                                 debug.knocked += 1
                             elseif offset < bestScore then
                                 local clear = true
@@ -874,19 +1003,41 @@ local function updateESP(camera)
     for _, target in ipairs(collectTargets()) do
         local character = target.character
         local humanoid  = target.humanoid
-        local head = character:FindFirstChild("Head")
-        local root = character:FindFirstChild("HumanoidRootPart")
+        local show      = false
 
         local allowed = target.isNPC or (not CONFIG.ESPTeamCheck) or target.enemy
-        local show    = false
+        local health  = humanoid and humanoid.Health or (actorHealth(character) or 1)
+        local knocked = humanoid and CONFIG.ESPKnockCheck
+            and isKnocked(humanoid, character)
 
-        if head and root and allowed and humanoid.Health > 0
-            and not (CONFIG.ESPKnockCheck and isKnocked(humanoid, character)) then
-            local distance = (root.Position - origin).Magnitude
+        local topWorld, bottomWorld, distance
 
+        if humanoid then
+            local head = character:FindFirstChild("Head")
+            local root = character:FindFirstChild("HumanoidRootPart")
+
+            if head and root then
+                topWorld    = head.Position + Vector3.new(0, 0.6, 0)
+                bottomWorld = root.Position - Vector3.new(0, 2.6, 0)
+                distance    = (root.Position - origin).Magnitude
+            end
+        else
+            -- a mob rig has no Head/HumanoidRootPart contract: the box is built
+            -- from the aim part's own height, so a one-part slime boxes correctly
+            local part = target.part
+
+            if part then
+                local half = part.Size.Y * 0.5
+                topWorld    = part.Position + Vector3.new(0, half, 0)
+                bottomWorld = part.Position - Vector3.new(0, half, 0)
+                distance    = (part.Position - origin).Magnitude
+            end
+        end
+
+        if topWorld and bottomWorld and allowed and health > 0 and not knocked then
             if distance <= CONFIG.ESPMaxDistance then
-                local top, topOk    = camera:WorldToViewportPoint(head.Position + Vector3.new(0, 0.6, 0))
-                local bottom, botOk = camera:WorldToViewportPoint(root.Position - Vector3.new(0, 2.6, 0))
+                local top, topOk    = camera:WorldToViewportPoint(topWorld)
+                local bottom, botOk = camera:WorldToViewportPoint(bottomWorld)
 
                 if topOk and botOk and top.Z > 0 and bottom.Z > 0 then
                     local entry = state.esp[character]
@@ -1045,6 +1196,7 @@ local function updateDebug(camera)
         .. "  wall-blocked: " .. tostring(debug.blocked)
         .. "  knocked: " .. tostring(debug.knocked)
         .. "  npcs: " .. tostring(debug.npcs)
+        .. "  mobs: " .. tostring(debug.mobs)
     labels.resolution.Text = ("viewport: %d x %d"):format(
         math.floor(camera.ViewportSize.X), math.floor(camera.ViewportSize.Y))
     labels.priority.Text = "render priority: " .. tostring(CONFIG.RenderPriority)
@@ -1197,11 +1349,17 @@ end
 -- ui helpers
 -- ======================================================================
 
-local ACCENT = Color3.fromRGB(255, 77, 141)
-local BG     = Color3.fromRGB(13, 13, 17)
-local PANEL  = Color3.fromRGB(21, 21, 27)
-local TEXT   = Color3.fromRGB(235, 235, 242)
-local MUTED  = Color3.fromRGB(120, 120, 132)
+local ACCENT      = Color3.fromRGB(255, 77, 141)
+local ACCENT_SOFT = Color3.fromRGB(255, 145, 182)
+local BG          = Color3.fromRGB(11, 11, 15)
+local PANEL       = Color3.fromRGB(17, 17, 23)
+local PANEL_HI    = Color3.fromRGB(28, 28, 36)
+local PANEL_LO    = Color3.fromRGB(21, 21, 28)
+local TEXT        = Color3.fromRGB(240, 240, 248)
+local MUTED       = Color3.fromRGB(116, 116, 130)
+local LINE        = Color3.fromRGB(35, 35, 45)
+
+local FAST = TweenInfo.new(0.12, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
 
 local function create(className, properties, parent)
     local inst = Instance.new(className)
@@ -1217,10 +1375,19 @@ local function corner(inst, radius)
     return inst
 end
 
-local function stroke(inst, colour, thickness)
+local function stroke(inst, colour, thickness, transparency)
     create("UIStroke", {
-        Color = colour or Color3.fromRGB(40, 40, 50),
+        Color = colour or LINE,
         Thickness = thickness or 1,
+        Transparency = transparency or 0,
+    }, inst)
+    return inst
+end
+
+local function gradient(inst, from, to, rotation)
+    create("UIGradient", {
+        Color = ColorSequence.new(from, to),
+        Rotation = rotation or 0,
     }, inst)
     return inst
 end
@@ -1233,9 +1400,45 @@ local function label(parent, text, size, colour, position)
         TextColor3 = colour or TEXT,
         TextSize = size or 13,
         TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Center,
         Position = position or UDim2.new(0, 0, 0, 0),
         Size = UDim2.new(1, 0, 1, 0),
     }, parent)
+end
+
+-- Section header: uppercase caption plus a hairline rule that fades into the
+-- page background, so the list reads as groups instead of one long column.
+local function section(parent, title)
+    local frame = create("Frame", {
+        Size = UDim2.new(1, -8, 0, 20),
+        BackgroundTransparency = 1,
+    }, parent)
+
+    label(frame, string.upper(title), 10, MUTED).Size = UDim2.new(0, 140, 0, 12)
+
+    local rule = create("Frame", {
+        Size = UDim2.new(1, -150, 0, 1),
+        Position = UDim2.new(0, 150, 0.5, 0),
+        BackgroundColor3 = LINE,
+        BorderSizePixel = 0,
+    }, frame)
+    gradient(rule, LINE, BG, 0)
+
+    return frame
+end
+
+local function divider(parent)
+    local rule = create("Frame", {
+        Size = UDim2.new(1, -8, 0, 1),
+        BackgroundColor3 = LINE,
+        BorderSizePixel = 0,
+    }, parent)
+    gradient(rule, LINE, BG, 0)
+    return rule
+end
+
+local function tween(inst, goal, info)
+    TweenService:Create(inst, info or FAST, goal):Play()
 end
 
 -- ======================================================================
@@ -1244,16 +1447,19 @@ end
 
 local function addToggle(parent, text, key, onChange)
     local row = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 26),
-        BackgroundTransparency = 1,
+        Size = UDim2.new(1, -8, 0, 28),
+        BackgroundColor3 = PANEL_LO,
+        BorderSizePixel = 0,
     }, parent)
+    corner(row, 6)
 
-    label(row, text, 13, TEXT).Size = UDim2.new(1, -46, 1, 0)
+    local title = label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0))
+    title.Size = UDim2.new(1, -56, 1, 0)
 
     local pill = create("Frame", {
         Size = UDim2.new(0, 34, 0, 18),
-        Position = UDim2.new(1, -34, 0.5, -9),
-        BackgroundColor3 = CONFIG[key] and ACCENT or Color3.fromRGB(45, 45, 55),
+        Position = UDim2.new(1, -44, 0.5, -9),
+        BackgroundColor3 = CONFIG[key] and ACCENT or PANEL_HI,
         BorderSizePixel = 0,
     }, row)
     corner(pill, 9)
@@ -1270,17 +1476,27 @@ local function addToggle(parent, text, key, onChange)
         Size = UDim2.new(1, 0, 1, 0),
         BackgroundTransparency = 1,
         Text = "",
+        AutoButtonColor = false,
     }, row)
 
     local function apply()
-        pill.BackgroundColor3 = CONFIG[key] and ACCENT or Color3.fromRGB(45, 45, 55)
-        dot.Position = CONFIG[key] and UDim2.new(0, 18, 0, 2) or UDim2.new(0, 2, 0, 2)
+        tween(pill, { BackgroundColor3 = CONFIG[key] and ACCENT or PANEL_HI })
+        tween(dot, {
+            Position = CONFIG[key] and UDim2.new(0, 18, 0, 2) or UDim2.new(0, 2, 0, 2),
+        })
     end
 
     hit.MouseButton1Click:Connect(function()
         CONFIG[key] = not CONFIG[key]
         apply()
         if onChange then onChange(CONFIG[key]) end
+    end)
+
+    hit.MouseEnter:Connect(function()
+        tween(row, { BackgroundColor3 = PANEL_HI })
+    end)
+    hit.MouseLeave:Connect(function()
+        tween(row, { BackgroundColor3 = PANEL_LO })
     end)
 
     table.insert(state.refreshers, apply)
@@ -1290,28 +1506,36 @@ end
 
 local function addSlider(parent, text, key, min, max, step, suffix)
     local row = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 40),
-        BackgroundTransparency = 1,
+        Size = UDim2.new(1, -8, 0, 46),
+        BackgroundColor3 = PANEL_LO,
+        BorderSizePixel = 0,
     }, parent)
+    corner(row, 6)
 
-    local title = label(row, text, 13, TEXT)
-    title.Size = UDim2.new(1, -60, 0, 16)
+    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 5)).Size = UDim2.new(1, -90, 0, 16)
+
+    local chip = create("Frame", {
+        Size = UDim2.new(0, 64, 0, 18),
+        Position = UDim2.new(1, -74, 0, 4),
+        BackgroundColor3 = PANEL_HI,
+        BorderSizePixel = 0,
+    }, row)
+    corner(chip, 4)
 
     local valueLabel = create("TextLabel", {
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamMedium,
         Text = "",
-        TextColor3 = MUTED,
-        TextSize = 12,
-        TextXAlignment = Enum.TextXAlignment.Right,
-        Position = UDim2.new(0, 0, 0, 0),
-        Size = UDim2.new(1, 0, 0, 16),
-    }, row)
+        TextColor3 = ACCENT_SOFT,
+        TextSize = 11,
+        TextXAlignment = Enum.TextXAlignment.Center,
+        Size = UDim2.new(1, 0, 1, 0),
+    }, chip)
 
     local track = create("Frame", {
-        Size = UDim2.new(1, 0, 0, 6),
-        Position = UDim2.new(0, 0, 0, 26),
-        BackgroundColor3 = Color3.fromRGB(40, 40, 50),
+        Size = UDim2.new(1, -20, 0, 5),
+        Position = UDim2.new(0, 10, 0, 33),
+        BackgroundColor3 = Color3.fromRGB(38, 38, 48),
         BorderSizePixel = 0,
     }, row)
     corner(track, 3)
@@ -1322,6 +1546,27 @@ local function addSlider(parent, text, key, min, max, step, suffix)
         BorderSizePixel = 0,
     }, track)
     corner(fill, 3)
+    gradient(fill, ACCENT, ACCENT_SOFT, 0)
+
+    local knob = create("Frame", {
+        Size = UDim2.new(0, 10, 0, 10),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0, 0, 0.5, 0),
+        BackgroundColor3 = Color3.fromRGB(255, 255, 255),
+        BorderSizePixel = 0,
+        ZIndex = 3,
+    }, track)
+    corner(knob, 5)
+
+    -- the visible track is 5 px; the grab area is 20, or the slider is unusable
+    local hit = create("TextButton", {
+        Size = UDim2.new(1, -10, 0, 22),
+        Position = UDim2.new(0, 5, 0, 24),
+        BackgroundTransparency = 1,
+        Text = "",
+        AutoButtonColor = false,
+        ZIndex = 4,
+    }, row)
 
     local dragging = false
 
@@ -1338,13 +1583,14 @@ local function addSlider(parent, text, key, min, max, step, suffix)
     end
 
     local function apply()
-        local alpha = (CONFIG[key] - min) / (max - min)
-        fill.Size = UDim2.new(math.clamp(alpha, 0, 1), 0, 1, 0)
+        local alpha = math.clamp((CONFIG[key] - min) / (max - min), 0, 1)
+        fill.Size     = UDim2.new(alpha, 0, 1, 0)
+        knob.Position = UDim2.new(alpha, 0, 0.5, 0)
         describe()
     end
 
     local function setFromX(x)
-        local alpha = math.clamp((x - track.AbsolutePosition.X) / track.AbsoluteSize.X, 0, 1)
+        local alpha = math.clamp((x - hit.AbsolutePosition.X) / hit.AbsoluteSize.X, 0, 1)
         local value = min + alpha * (max - min)
         if step and step > 0 then
             value = math.floor(value / step + 0.5) * step
@@ -1353,7 +1599,7 @@ local function addSlider(parent, text, key, min, max, step, suffix)
         apply()
     end
 
-    track.InputBegan:Connect(function(input)
+    hit.InputBegan:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
             dragging = true
             setFromX(input.Position.X)
@@ -1372,6 +1618,13 @@ local function addSlider(parent, text, key, min, max, step, suffix)
         end
     end)
 
+    hit.MouseEnter:Connect(function()
+        tween(row, { BackgroundColor3 = PANEL_HI })
+    end)
+    hit.MouseLeave:Connect(function()
+        tween(row, { BackgroundColor3 = PANEL_LO })
+    end)
+
     table.insert(state.refreshers, apply)
     apply()
     return row
@@ -1379,20 +1632,22 @@ end
 
 local function addCycle(parent, text, key, options)
     local row = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 26),
-        BackgroundTransparency = 1,
+        Size = UDim2.new(1, -8, 0, 28),
+        BackgroundColor3 = PANEL_LO,
+        BorderSizePixel = 0,
     }, parent)
+    corner(row, 6)
 
-    label(row, text, 13, TEXT).Size = UDim2.new(1, -110, 1, 0)
+    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0)).Size = UDim2.new(1, -124, 1, 0)
 
     local button = create("TextButton", {
-        Size = UDim2.new(0, 100, 0, 20),
-        Position = UDim2.new(1, -100, 0.5, -10),
-        BackgroundColor3 = Color3.fromRGB(32, 32, 40),
+        Size = UDim2.new(0, 104, 0, 20),
+        Position = UDim2.new(1, -114, 0.5, -10),
+        BackgroundColor3 = PANEL_HI,
         BorderSizePixel = 0,
         Font = Enum.Font.GothamMedium,
         Text = tostring(CONFIG[key]),
-        TextColor3 = TEXT,
+        TextColor3 = ACCENT_SOFT,
         TextSize = 12,
         AutoButtonColor = false,
     }, row)
@@ -1412,6 +1667,13 @@ local function addCycle(parent, text, key, options)
         apply()
     end)
 
+    button.MouseEnter:Connect(function()
+        tween(row, { BackgroundColor3 = PANEL_HI })
+    end)
+    button.MouseLeave:Connect(function()
+        tween(row, { BackgroundColor3 = PANEL_LO })
+    end)
+
     table.insert(state.refreshers, apply)
     apply()
     return row
@@ -1419,16 +1681,18 @@ end
 
 local function addKeybind(parent, text, key)
     local row = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 26),
-        BackgroundTransparency = 1,
+        Size = UDim2.new(1, -8, 0, 28),
+        BackgroundColor3 = PANEL_LO,
+        BorderSizePixel = 0,
     }, parent)
+    corner(row, 6)
 
-    label(row, text, 13, TEXT).Size = UDim2.new(1, -110, 1, 0)
+    label(row, text, 13, TEXT, UDim2.new(0, 10, 0, 0)).Size = UDim2.new(1, -124, 1, 0)
 
     local button = create("TextButton", {
-        Size = UDim2.new(0, 100, 0, 20),
-        Position = UDim2.new(1, -100, 0.5, -10),
-        BackgroundColor3 = Color3.fromRGB(32, 32, 40),
+        Size = UDim2.new(0, 104, 0, 20),
+        Position = UDim2.new(1, -114, 0.5, -10),
+        BackgroundColor3 = PANEL_HI,
         BorderSizePixel = 0,
         Font = Enum.Font.GothamMedium,
         Text = tostring(CONFIG[key]),
@@ -1459,6 +1723,13 @@ local function addKeybind(parent, text, key)
         end)
     end)
 
+    button.MouseEnter:Connect(function()
+        tween(row, { BackgroundColor3 = PANEL_HI })
+    end)
+    button.MouseLeave:Connect(function()
+        tween(row, { BackgroundColor3 = PANEL_LO })
+    end)
+
     table.insert(state.refreshers, apply)
     apply()
     return row
@@ -1466,8 +1737,8 @@ end
 
 local function addButton(parent, text, onClick)
     local button = create("TextButton", {
-        Size = UDim2.new(1, -8, 0, 26),
-        BackgroundColor3 = Color3.fromRGB(32, 32, 40),
+        Size = UDim2.new(1, -8, 0, 28),
+        BackgroundColor3 = PANEL_LO,
         BorderSizePixel = 0,
         Font = Enum.Font.GothamMedium,
         Text = text,
@@ -1475,9 +1746,17 @@ local function addButton(parent, text, onClick)
         TextSize = 12,
         AutoButtonColor = false,
     }, parent)
-    corner(button, 4)
+    corner(button, 6)
 
     button.MouseButton1Click:Connect(onClick)
+
+    button.MouseEnter:Connect(function()
+        tween(button, { BackgroundColor3 = PANEL_HI, TextColor3 = ACCENT_SOFT })
+    end)
+    button.MouseLeave:Connect(function()
+        tween(button, { BackgroundColor3 = PANEL_LO, TextColor3 = TEXT })
+    end)
+
     return button
 end
 
@@ -1529,7 +1808,8 @@ local function printReport()
     print("viewport:", camera and tostring(camera.ViewportSize) or "nil")
     print("aiming:", state.aiming, "target:", state.debug.found)
     print("in FOV:", state.debug.candidates, "wall-blocked:", state.debug.blocked,
-        "knocked:", state.debug.knocked, "npcs:", state.debug.npcs)
+        "knocked:", state.debug.knocked, "npcs:", state.debug.npcs,
+        "mobs:", state.debug.mobs)
     print("murderer:", state.debug.murderer, "sheriff:", state.debug.sheriff,
         "dropped guns:", state.debug.guns, "target role:", CONFIG.TargetRoles)
     print("players:", #Players:GetPlayers())
@@ -1598,50 +1878,111 @@ local function buildWindow()
         gui.Parent = localPlayer:WaitForChild("PlayerGui")
     end
 
+    local WINDOW_W, WINDOW_H = 484, 376
+
+    -- a soft drop shadow behind the window: a second frame, since the window
+    -- itself clips descendants and would eat any shadow parented to it
+    local shadow = create("Frame", {
+        Name = "Shadow",
+        Size = UDim2.new(0, WINDOW_W, 0, WINDOW_H),
+        Position = UDim2.new(0.5, -WINDOW_W / 2 + 5, 0.5, -WINDOW_H / 2 + 7),
+        BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+        BackgroundTransparency = 0.45,
+        BorderSizePixel = 0,
+        ZIndex = 1,
+    }, gui)
+    corner(shadow, 12)
+
     local window = create("Frame", {
         Name = "Window",
-        Size = UDim2.new(0, 480, 0, 340),
-        Position = UDim2.new(0.5, -240, 0.5, -170),
+        Size = UDim2.new(0, WINDOW_W, 0, WINDOW_H),
+        Position = UDim2.new(0.5, -WINDOW_W / 2, 0.5, -WINDOW_H / 2),
         BackgroundColor3 = BG,
         BorderSizePixel = 0,
         ClipsDescendants = true,
+        ZIndex = 2,
     }, gui)
     corner(window, 8)
-    stroke(window, Color3.fromRGB(38, 38, 48))
+    stroke(window, Color3.fromRGB(44, 44, 58))
 
     local titleBar = create("Frame", {
-        Size = UDim2.new(1, 0, 0, 30),
-        BackgroundColor3 = PANEL,
+        Size = UDim2.new(1, 0, 0, 36),
+        BackgroundColor3 = PANEL_HI,
         BorderSizePixel = 0,
+        ZIndex = 3,
     }, window)
+    gradient(titleBar, PANEL_HI, PANEL, 90)
 
+    -- accent rule under the title bar: the one saturated line in the chrome
+    local titleRule = create("Frame", {
+        Size = UDim2.new(1, 0, 0, 2),
+        Position = UDim2.new(0, 0, 0, 36),
+        BackgroundColor3 = ACCENT,
+        BorderSizePixel = 0,
+        ZIndex = 3,
+    }, window)
+    gradient(titleRule, ACCENT, Color3.fromRGB(120, 40, 70), 0)
+
+    local brand = label(titleBar, "ewanko", 15, TEXT, UDim2.new(0, 14, 0, 0))
+    brand.Size = UDim2.new(0, 66, 1, 0)
+    brand.Font = Enum.Font.GothamBold
+
+    local versionChip = create("Frame", {
+        Size = UDim2.new(0, 32, 0, 16),
+        Position = UDim2.new(0, 76, 0.5, -8),
+        BackgroundColor3 = Color3.fromRGB(40, 40, 52),
+        BorderSizePixel = 0,
+        ZIndex = 4,
+    }, titleBar)
+    corner(versionChip, 4)
     create("TextLabel", {
         BackgroundTransparency = 1,
-        Font = Enum.Font.GothamBold,
-        Text = "ewanko  " .. VERSION,
-        TextColor3 = TEXT,
-        TextSize = 13,
-        TextXAlignment = Enum.TextXAlignment.Left,
-        Position = UDim2.new(0, 12, 0, 0),
-        Size = UDim2.new(1, -60, 1, 0),
-    }, titleBar)
+        Font = Enum.Font.GothamMedium,
+        Text = VERSION,
+        TextColor3 = ACCENT_SOFT,
+        TextSize = 10,
+        Size = UDim2.new(1, 0, 1, 0),
+    }, versionChip)
 
     local close = create("TextButton", {
-        Size = UDim2.new(0, 26, 0, 20),
-        Position = UDim2.new(1, -32, 0.5, -10),
-        BackgroundColor3 = Color3.fromRGB(40, 40, 50),
+        Size = UDim2.new(0, 26, 0, 22),
+        Position = UDim2.new(1, -34, 0.5, -11),
+        BackgroundColor3 = Color3.fromRGB(44, 44, 56),
         BorderSizePixel = 0,
         Font = Enum.Font.GothamBold,
         Text = "x",
         TextColor3 = TEXT,
         TextSize = 12,
         AutoButtonColor = false,
+        ZIndex = 4,
     }, titleBar)
-    corner(close, 4)
+    corner(close, 5)
+
+    -- streamer chip: one click hides the window, the ESP and the FOV circle
+    local streamChip = create("TextButton", {
+        Size = UDim2.new(0, 62, 0, 18),
+        Position = UDim2.new(1, -104, 0.5, -9),
+        BackgroundColor3 = Color3.fromRGB(40, 40, 52),
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamMedium,
+        Text = "STREAM",
+        TextColor3 = MUTED,
+        TextSize = 10,
+        AutoButtonColor = false,
+        ZIndex = 4,
+    }, titleBar)
+    corner(streamChip, 4)
 
     close.MouseButton1Click:Connect(function()
         gui.Enabled = not gui.Enabled
         state.uiClosed = not gui.Enabled
+    end)
+
+    close.MouseEnter:Connect(function()
+        tween(close, { BackgroundColor3 = ACCENT })
+    end)
+    close.MouseLeave:Connect(function()
+        tween(close, { BackgroundColor3 = Color3.fromRGB(44, 44, 56) })
     end)
 
     titleBar.InputBegan:Connect(function(input)
@@ -1655,11 +1996,18 @@ local function buildWindow()
     UserInputService.InputChanged:Connect(function(input)
         if state.dragging and input.UserInputType == Enum.UserInputType.MouseMovement then
             local delta = input.Position - state.dragStart
-            window.Position = UDim2.new(
+            local nextPosition = UDim2.new(
                 state.dragOrigin.X.Scale,
                 state.dragOrigin.X.Offset + delta.X,
                 state.dragOrigin.Y.Scale,
                 state.dragOrigin.Y.Offset + delta.Y
+            )
+            window.Position = nextPosition
+            shadow.Position = UDim2.new(
+                nextPosition.X.Scale,
+                nextPosition.X.Offset + 5,
+                nextPosition.Y.Scale,
+                nextPosition.Y.Offset + 7
             )
         end
     end)
@@ -1774,7 +2122,8 @@ local function buildWindow()
     addToggle(aimPage, "Team check", "TeamCheck")
     addToggle(aimPage, "Wall check", "WallCheck")
     addToggle(aimPage, "Skip knocked/downed", "KnockCheck")
-    addToggle(aimPage, "Aim at NPCs", "NPCs", refreshAll)
+    addToggle(aimPage, "Aim at NPCs/mobs/bots", "NPCs", refreshAll)
+    addToggle(aimPage, "Mobs (no Humanoid)", "Mobs")
     addToggle(aimPage, "Role check", "RoleCheck")
     addCycle(aimPage, "Target role", "TargetRoles", { "All", "Murderer", "Sheriff", "Innocent" })
 
@@ -1784,11 +2133,11 @@ local function buildWindow()
     addToggle(visualPage, "ESP boxes", "ESPBoxes")
     addToggle(visualPage, "ESP names", "ESPNames")
     addToggle(visualPage, "ESP team check", "ESPTeamCheck")
-    addToggle(visualPage, "ESP NPCs", "NPCs", refreshAll)
+    addToggle(visualPage, "ESP NPCs/mobs/bots", "NPCs", refreshAll)
     addToggle(visualPage, "ESP hide knocked", "ESPKnockCheck")
     addToggle(visualPage, "ESP roles [M]/[S]", "ESPShowRoles")
-    addToggle(visualPage, "ESP dropped gun", "GunESP")
     addSlider(visualPage, "ESP distance", "ESPMaxDistance", 50, 1500, 25, " studs")
+    addToggle(visualPage, "ESP dropped gun", "GunESP")
 
     -- FIX tab: the switches that make it work in games that fight the camera
     addCycle(compatibilityPage, "Aim method", "AimMethod", { "Auto", "Camera", "Mouse", "Subject" })
@@ -1799,8 +2148,8 @@ local function buildWindow()
     addToggle(compatibilityPage, "Safe mode", "SafeMode")
     addSlider(compatibilityPage, "Render priority", "RenderPriority", 199, 2000, 1)
     addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
-    addSlider(compatibilityPage, "NPC rescan", "NPCRate", 0.1, 2, 0.1, " s")
-    addSlider(compatibilityPage, "NPC scan depth", "NPCDepth", 1, 4, 1)
+    addSlider(compatibilityPage, "Actor rescan", "NPCRate", 0.1, 2, 0.1, " s")
+    addSlider(compatibilityPage, "Actor scan depth", "NPCDepth", 1, 4, 1)
     addSlider(compatibilityPage, "Role rescan", "RoleRate", 0.1, 2, 0.1, " s")
     addSlider(compatibilityPage, "Gun rescan", "GunRate", 0.1, 2, 0.1, " s")
     addKeybind(compatibilityPage, "Panic key", "PanicKey")
