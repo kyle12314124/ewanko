@@ -2121,9 +2121,11 @@ local function buildWindow()
     end
 
     local function makeTab(name, order)
+        -- flush to the strip's left edge: the accent bar has to sit on that
+        -- edge, not float 6px inside it
         local button = create("TextButton", {
-            Size = UDim2.new(1, -12, 0, 28),
-            Position = UDim2.new(0, 6, 0, 8 + (order - 1) * 32),
+            Size = UDim2.new(1, -8, 0, 28),
+            Position = UDim2.new(0, 0, 0, 8 + (order - 1) * 32),
             BackgroundColor3 = TAB_IDLE,
             BorderSizePixel = 0,
             Font = Enum.Font.GothamMedium,
@@ -2135,11 +2137,13 @@ local function buildWindow()
         }, tabs)
         corner(button, 4)
 
-        create("UIPadding", { PaddingLeft = UDim.new(0, 11) }, button)
+        create("UIPadding", { PaddingLeft = UDim.new(0, 12) }, button)
 
+        -- full-height marker, inset 1px top and bottom so it follows the
+        -- button's rounded corners instead of cutting across them
         local bar = create("Frame", {
             Size = UDim2.new(0, 2, 0, 0),
-            Position = UDim2.new(0, 0, 0.5, 0),
+            Position = UDim2.new(0, 0, 0, 1),
             BackgroundColor3 = ACCENT,
             BorderSizePixel = 0,
         }, button)
@@ -2151,7 +2155,9 @@ local function buildWindow()
             button:SetAttribute("active", active)
             button.BackgroundColor3 = active and PANEL_HI or TAB_IDLE
             button.TextColor3 = active and TEXT or MUTED
-            bar.Size = UDim2.new(0, 2, active and 0.62 or 0, 0)
+            bar.Size = active
+                and UDim2.new(0, 2, 1, -2)
+                or UDim2.new(0, 2, 0, 0)
         end
 
         button.MouseButton1Click:Connect(function()
