@@ -14,7 +14,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v9"
+local VERSION = "v10"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -41,14 +41,14 @@ local CONFIG = {
     SelectInterval    = 0.03,
 
     -- aim method: mouse mode drives the game's own camera instead of writing CFrames
-    AimMethod         = "Auto",     -- Auto | Camera | Mouse
+    AimMethod         = "Camera",   -- Auto | Camera | Mouse
     MouseGain         = 1.0,
-    AutoFallback      = true,       -- detect an overwritten camera and switch to mouse
-    MouseRate         = 40,         -- max mousemoverel calls per second
-    MouseClamp        = 25,         -- max pixels moved per call
+    AutoFallback      = false,      -- off by default: input injection is the crash vector
+    MouseRate         = 20,         -- max mousemoverel calls per second
+    MouseClamp        = 15,         -- max pixels moved per call
 
     -- stability
-    RenderPriority    = 200,        -- stock camera slot while bisecting; raise once it's proven
+    RenderPriority    = 200,        -- stock camera slot; raise only after a clean nudge test
     SafeMode          = true,       -- no humanize, no Drawing churn, throttled mouse
     PanicKey          = "End",      -- always unloads, works even if the UI is gone
     UIWatchdog        = false,      -- re-parent loop; off while bisecting, it masks the cause
@@ -73,7 +73,6 @@ local CONFIG = {
 
     -- menu
     MenuKeyName       = "RightShift",
-    MaxErrors         = 20,
 }
 
 local DEFAULTS = {}
@@ -628,7 +627,7 @@ end
 local function safeRender(dt)
     local ok, err = pcall(onRender, dt)
     if ok then
-        if state.errorCount > 0 and state.errorCount < CONFIG.MaxErrors then
+        if state.errorCount > 0 then
             state.errorCount = 0
             state.lastError = ""
         end
@@ -638,19 +637,16 @@ local function safeRender(dt)
     state.errorCount  += 1
     state.lastError = tostring(err)
 
-    -- degrade before dying: drop to the lowest safe render slot and stop touching Drawing
-    if state.errorCount == 3 then
-        CONFIG.SafeMode = true
-        pcall(function() RunService:UnbindFromRenderStep("EwankoAimbot") end)
-        pcall(function()
-            RunService:BindToRenderStep("EwankoAimbot", Enum.RenderPriority.Camera.Value, safeRender)
-        end)
+    -- a recurring error must not take the menu down with it: that is what
+    -- "the cheat crashed and the UI vanished" actually looked like
+    if state.errorCount == 20 then
+        warn("[ewanko] render error, aim disabled: " .. tostring(err))
     end
 
-    if state.errorCount >= CONFIG.MaxErrors then
-        warn(("[ewanko] self-unbind after %d render errors: %s")
-            :format(state.errorCount, tostring(err)))
-        if getgenv().EwankoUnload then getgenv().EwankoUnload() end
+    if state.errorCount >= 20 then
+        state.aiming = false
+        state.target = nil
+        state.stuckFrames = 0
     end
 end
 
