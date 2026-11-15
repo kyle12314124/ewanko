@@ -1,6 +1,7 @@
--- ewanko aimbot v16 — players, NPCs, mobs and bots share one target list,
+-- ewanko aimbot v16.3 — players, NPCs, mobs and bots share one target list,
 -- knock/down check, role detection (murderer / sheriff) and dropped-gun ESP,
--- camera write at RenderPriority.Last, per-frame mouse fallback, streamer mode
+-- skeleton and health bar, camera write at RenderPriority.Last, per-frame
+-- mouse fallback, hide mode for capture
 -- Luau / executor context. One file, no external UI library.
 
 local Players          = game:GetService("Players")
@@ -16,7 +17,7 @@ if not localPlayer then
     localPlayer = Players.LocalPlayer
 end
 
-local VERSION = "v16.2"
+local VERSION = "v16.3"
 
 -- per-instance liveness: a second execution must not kill the first one's loops
 local alive = true
@@ -103,6 +104,12 @@ local CONFIG = {
 
     -- menu
     MenuKeyName       = "RightShift",
+
+    -- capture: one press drops every pixel this script draws, UI included.
+    -- Luau cannot block a desktop capture, so the window is removed from the
+    -- frame instead of being hidden from the capture API.
+    HideKey           = "F2",
+    HideOnFocusLost   = true,       -- hide when the game window loses focus
 }
 
 local DEFAULTS = {}
@@ -146,9 +153,9 @@ local state = {
     gunESP       = {},
     uiClosed     = false,
     uiRebuilds   = 0,
-    stealth      = false,
+    hidden       = false,
+    hideChip     = nil,
     statusLabel  = nil,
-    lastDt       = 1 / 60,
     stage        = "boot",
     debug        = { candidates = 0, blocked = 0, knocked = 0, npcs = 0, mobs = 0,
                      murderer = 0, sheriff = 0, guns = 0, found = false },
@@ -202,6 +209,15 @@ rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.IgnoreWater = true
 
 local fovCircle
+
+-- One probe instead of a typeof check per call: executors expose Drawing as a
+-- table, a userdata-backed table, or not at all, and typeof disagrees on the
+-- middle case. Presence of Drawing.new is the only fact that matters.
+local hasDrawing = false
+do
+    local ok, probe = pcall(function() return Drawing.new end)
+    hasDrawing = ok and probe ~= nil
+end
 
 local function currentCamera()
     return Workspace.CurrentCamera
@@ -265,7 +281,7 @@ end
 -- Drawing objects are created on demand: creating them at load is one of the
 -- things that kills a client before you ever press the aim key.
 local function ensureCircle()
-    if fovCircle or typeof(Drawing) ~= "table" then return fovCircle end
+    if fovCircle or not hasDrawing then return fovCircle end
 
     local ok, circle = pcall(function()
         local c = Drawing.new("Circle")
@@ -1081,7 +1097,7 @@ local function newHealthBar()
 end
 
 local function newESPEntry()
-    if typeof(Drawing) ~= "table" then return nil end
+    if not hasDrawing then return nil end
 
     local ok, entry = pcall(function()
         local box = Drawing.new("Square")
@@ -1150,7 +1166,13 @@ local function clearESP()
 end
 
 local function updateESP(camera)
-    if not CONFIG.ESP or typeof(Drawing) ~= "table" then
+    -- skeleton and health ride their own switches: either can be the only
+    -- thing on screen, so the master ESP toggle is not a gate on them. The
+    -- dropped-gun box is independent of all three.
+    local targetVisual = CONFIG.ESP or CONFIG.SkeletonESP or CONFIG.HealthBar
+    local anyVisual    = targetVisual or CONFIG.GunESP
+
+    if not anyVisual or not hasDrawing then
         for _, entry in pairs(state.esp) do hideESP(entry) end
         for _, entry in pairs(state.gunESP) do hideESP(entry) end
         return
@@ -1322,8 +1344,8 @@ local function updateESP(camera)
                         end
 
                         seen[character] = true
-                        show = CONFIG.ESPBoxes or CONFIG.ESPNames
-                            or showSkeleton or showHealth
+                        show = targetVisual and (CONFIG.ESPBoxes or CONFIG.ESPNames
+                            or showSkeleton or showHealth)
                     end
                 end
             end
@@ -1479,22 +1501,28 @@ local function onRender(dt)
     state.stage = "debug"
     updateDebug(camera)
 
-    if CONFIG.FOVCircle then
-        state.stage = "fovcircle"
-        local circle = ensureCircle()
-        if circle then
-            circle.Position  = screenCentre(camera)
-            circle.Radius    = CONFIG.FOV
-            circle.Color     = rgb(CONFIG.CircleColor)
-            circle.Thickness = CONFIG.CircleThickness
-            circle.Visible   = state.aiming
+    if state.hidden then
+        -- capture mode: nothing this script draws is on screen
+        if fovCircle then fovCircle.Visible = false end
+        state.stage = "hidden"
+    else
+        if CONFIG.FOVCircle then
+            state.stage = "fovcircle"
+            local circle = ensureCircle()
+            if circle then
+                circle.Position  = screenCentre(camera)
+                circle.Radius    = CONFIG.FOV
+                circle.Color     = rgb(CONFIG.CircleColor)
+                circle.Thickness = CONFIG.CircleThickness
+                circle.Visible   = state.aiming
+            end
+        elseif fovCircle then
+            fovCircle.Visible = false
         end
-    elseif fovCircle then
-        fovCircle.Visible = false
-    end
 
-    state.stage = "esp"
-    updateESP(camera)
+        state.stage = "esp"
+        updateESP(camera)
+    end
 
     if not state.aiming or not CONFIG.AimEnabled then
         state.target = nil
@@ -1694,16 +1722,6 @@ local function section(parent, title)
     return frame
 end
 
-local function divider(parent)
-    local rule = create("Frame", {
-        Size = UDim2.new(1, -8, 0, 1),
-        BackgroundColor3 = LINE,
-        BorderSizePixel = 0,
-    }, parent)
-    gradient(rule, LINE, BG, 0)
-    return rule
-end
-
 local function tween(inst, goal, info)
     TweenService:Create(inst, info or FAST, goal):Play()
 end
@@ -1773,7 +1791,7 @@ local function addToggle(parent, text, key, onChange)
     return row
 end
 
-local function addSlider(parent, text, key, min, max, step, suffix)
+local function addSlider(parent, text, key, min, max, step, suffix, onChange)
     local row = create("Frame", {
         Size = UDim2.new(1, 0, 0, 46),
         BackgroundColor3 = PANEL_HI,
@@ -1878,6 +1896,7 @@ local function addSlider(parent, text, key, min, max, step, suffix)
 
     UserInputService.InputEnded:Connect(function(input)
         if input.UserInputType == Enum.UserInputType.MouseButton1 then
+            if dragging and onChange then onChange(CONFIG[key]) end
             dragging = false
         end
     end)
@@ -2084,6 +2103,7 @@ local function printReport()
     print("method:", state.mouseMode and "mouse" or "camera",
         "stuck:", state.stuckFrames, "mousemoverel:", hasMouseMove)
     print("stage:", state.stage)
+    print("hidden:", state.hidden, "hide key:", CONFIG.HideKey)
     for key, value in pairs(CONFIG) do
         if type(value) ~= "table" then
             print(string.format("  %-18s %s", key, tostring(value)))
@@ -2125,6 +2145,9 @@ end
 -- ======================================================================
 -- window
 -- ======================================================================
+
+-- forward declaration: the title-bar chip calls this before it is assigned
+local setHidden
 
 local function buildWindow()
     local parent = game:GetService("CoreGui")
@@ -2194,7 +2217,7 @@ local function buildWindow()
     brand.Font = Enum.Font.GothamBold
 
     local versionChip = create("Frame", {
-        Size = UDim2.new(0, 32, 0, 16),
+        Size = UDim2.new(0, 40, 0, 16),
         Position = UDim2.new(0, 76, 0.5, -8),
         BackgroundColor3 = Color3.fromRGB(40, 40, 52),
         BorderSizePixel = 0,
@@ -2213,7 +2236,7 @@ local function buildWindow()
     -- live state pill: read the aim state off the chrome, not the FIX tab
     local statusPill = create("Frame", {
         Size = UDim2.new(0, 76, 0, 18),
-        Position = UDim2.new(1, -192, 0.5, -9),
+        Position = UDim2.new(1, -172, 0.5, -9),
         BackgroundColor3 = Color3.fromRGB(24, 24, 32),
         BorderSizePixel = 0,
         ZIndex = 4,
@@ -2243,6 +2266,38 @@ local function buildWindow()
     }, statusPill)
 
     state.statusLabel = { pill = statusPill, dot = statusDot, text = statusText }
+
+    -- hide chip: drops the window, the ESP and the FOV circle in one click
+    local hideChip = create("TextButton", {
+        Size = UDim2.new(0, 48, 0, 18),
+        Position = UDim2.new(1, -88, 0.5, -9),
+        BackgroundColor3 = Color3.fromRGB(40, 40, 52),
+        BorderSizePixel = 0,
+        Font = Enum.Font.GothamMedium,
+        Text = "HIDE",
+        TextColor3 = MUTED,
+        TextSize = 10,
+        AutoButtonColor = false,
+        ZIndex = 4,
+    }, titleBar)
+    corner(hideChip, 4)
+    state.hideChip = hideChip
+
+    hideChip.MouseButton1Click:Connect(function()
+        setHidden(not state.hidden)
+    end)
+
+    hideChip.MouseEnter:Connect(function()
+        if not state.hidden then
+            tween(hideChip, { BackgroundColor3 = PANEL_LO, TextColor3 = TEXT })
+        end
+    end)
+    hideChip.MouseLeave:Connect(function()
+        if not state.hidden then
+            tween(hideChip, { BackgroundColor3 = Color3.fromRGB(40, 40, 52),
+                TextColor3 = MUTED })
+        end
+    end)
 
     local close = create("TextButton", {
         Size = UDim2.new(0, 26, 0, 22),
@@ -2502,7 +2557,20 @@ local function buildWindow()
 
     section(compatibilityPage, "stability")
     addToggle(compatibilityPage, "Safe mode", "SafeMode")
-    addSlider(compatibilityPage, "Render priority", "RenderPriority", 199, 2000, 1)
+    addSlider(compatibilityPage, "Render priority", "RenderPriority", 199, 2000, 1, nil,
+        function(value)
+            -- rebinding mid-session is the whole point of the slider: a
+            -- priority that only lands on reload is a number, not a control
+            local ok = pcall(function()
+                RunService:UnbindFromRenderStep("EwankoAimbot")
+                RunService:BindToRenderStep("EwankoAimbot", value, safeRender)
+            end)
+            if not ok then
+                pcall(function()
+                    RunService:BindToRenderStep("EwankoAimbot", 1999, safeRender)
+                end)
+            end
+        end)
     addToggle(compatibilityPage, "Raycast collidable only", "CollidableOnly")
     addSlider(compatibilityPage, "Actor rescan", "NPCRate", 0.1, 2, 0.1, " s")
     addSlider(compatibilityPage, "Actor scan depth", "NPCDepth", 1, 4, 1)
@@ -2578,6 +2646,10 @@ local function buildWindow()
         if getgenv().EwankoUnload then getgenv().EwankoUnload() end
     end)
 
+    section(configPage, "capture")
+    addKeybind(configPage, "Hide key", "HideKey")
+    addToggle(configPage, "Hide on focus loss", "HideOnFocusLost")
+
     local footer = label(configPage,
         "ewanko " .. VERSION .. "  ·  " .. CONFIG.AimMethod .. "  ·  "
             .. tostring(#Players:GetPlayers()) .. " players",
@@ -2597,6 +2669,41 @@ end
 -- ======================================================================
 
 local gui = buildWindow()
+
+-- Hide mode: the whole ScreenGui is disabled, not made transparent, and every
+-- Drawing this script owns is removed. The aim loop keeps running, so the
+-- feature still works while nothing is on screen. Luau has no API that can stop
+-- a desktop capture, so the only honest answer is "draw nothing at all".
+setHidden = function(hidden)
+    state.hidden   = hidden and true or false
+    state.uiClosed = state.hidden
+
+    if gui then
+        gui.Enabled = not state.hidden
+    end
+
+    local chip = state.hideChip
+    if chip then
+        chip.Text = state.hidden and "HIDDEN" or "HIDE"
+        chip.TextColor3 = state.hidden and ACCENT or MUTED
+        chip.BackgroundColor3 = state.hidden
+            and Color3.fromRGB(52, 24, 38)
+            or Color3.fromRGB(40, 40, 52)
+    end
+
+    if state.hidden then
+        clearESP()
+        if fovCircle then fovCircle.Visible = false end
+    end
+end
+
+-- Alt-tabbing out of the game drops everything too: that is the moment a
+-- screenshot or a capture window usually happens.
+UserInputService.WindowFocusReleased:Connect(function()
+    if CONFIG.HideOnFocusLost and not state.hidden then
+        setHidden(true)
+    end
+end)
 
 -- Chrome state, refreshed off the render path: no UI work inside the aim loop.
 task.spawn(function()
@@ -2708,6 +2815,9 @@ UserInputService.InputBegan:Connect(function(input, processed)
         return
     end
 
+    -- hide key sits beside panic: it has to work while the window is disabled
+    -- (checked after the bind capture, so F2 is still bindable)
+
     if state.awaitingBind and state.bindArmed then
         local bind = bindFromInput(input)
         if bind then
@@ -2719,13 +2829,24 @@ UserInputService.InputBegan:Connect(function(input, processed)
         end
     end
 
+    if inputMatches(input, CONFIG.HideKey) then
+        setHidden(not state.hidden)
+        return
+    end
+
     if inputMatches(input, CONFIG.MenuKeyName) then
+        if state.hidden then
+            setHidden(false)
+            return
+        end
         gui.Enabled = not gui.Enabled
         state.uiClosed = not gui.Enabled
         return
     end
 
-    if inputMatches(input, CONFIG.KeyName) then
+    -- processed means the game already ate this key: typing "q" in chat must
+    -- not aim at somebody
+    if not processed and inputMatches(input, CONFIG.KeyName) then
         aimPressed()
     end
 end)
@@ -2741,12 +2862,21 @@ Players.PlayerRemoving:Connect(function(player)
 
     local character = player.Character
     local entry = character and state.esp[character]
+
     if entry then
         pcall(function()
             entry.box:Remove()
             entry.name:Remove()
+            if entry.bones then
+                for _, line in ipairs(entry.bones) do line:Remove() end
+            end
+            if entry.healthBar then
+                entry.healthBar.fill:Remove()
+                entry.healthBar.back:Remove()
+            end
         end)
         state.esp[character] = nil
+        rigCache[character] = nil
     end
 end)
 
@@ -2797,5 +2927,6 @@ if isfile and isfile(CONFIG_FILE) then
 end
 
 print("[ewanko] " .. VERSION .. " bound — " .. CONFIG.AimMode .. " " .. CONFIG.KeyName
-    .. " to aim, " .. CONFIG.MenuKeyName .. " for the menu, " .. CONFIG.PanicKey
+    .. " to aim, " .. CONFIG.MenuKeyName .. " for the menu, " .. CONFIG.HideKey
+    .. " to hide, " .. CONFIG.PanicKey
     .. " to panic, aim method " .. CONFIG.AimMethod .. ".")
